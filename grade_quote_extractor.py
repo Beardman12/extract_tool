@@ -51,6 +51,7 @@ class ProductCodeBlock:
     service_codes: List[str]
     start_row: int
     end_row: int
+    sheet_name: str = ""
 
 
 class GradeQuoteExtractor:
@@ -61,6 +62,13 @@ class GradeQuoteExtractor:
         if sheet_name not in self.workbook.sheetnames:
             raise ValueError(f"未找到工作表: {sheet_name}")
         self.ws: Worksheet = self.workbook[sheet_name]
+        self.merged_lookup = self._build_merged_lookup(self.ws)
+
+    def _activate_sheet(self, sheet_name: str) -> None:
+        if sheet_name not in self.workbook.sheetnames:
+            raise ValueError(f"未找到工作表: {sheet_name}")
+        self.sheet_name = sheet_name
+        self.ws = self.workbook[sheet_name]
         self.merged_lookup = self._build_merged_lookup(self.ws)
 
     @staticmethod
@@ -302,6 +310,7 @@ class GradeQuoteExtractor:
                     blocks.append(current)
 
                 current = ProductCodeBlock(
+                    sheet_name=self.sheet_name,
                     product_name=product_name,
                     service_text=service_text,
                     service_codes=codes,
@@ -554,6 +563,7 @@ class GradeQuoteExtractor:
             "by_product_code": by_product_code,
             "blocks": [
                 {
+                    "sheet": b.sheet_name,
                     "产品名称": b.product_name,
                     "服务代码原文": b.service_text,
                     "产品代码列表": b.service_codes,
@@ -562,6 +572,67 @@ class GradeQuoteExtractor:
                 }
                 for b in blocks
             ],
+        }
+
+    def extract_all_sheets(self, include_sheets: Optional[List[str]] = None) -> Dict[str, Any]:
+        original_sheet = self.sheet_name
+
+        target_sheets = include_sheets or self.workbook.sheetnames
+        collected: List[Dict[str, Any]] = []
+
+        for sheet in target_sheets:
+            try:
+                self._activate_sheet(sheet)
+                result = self.extract()
+                # 至少有一条记录才算有效报价表
+                if result["meta"]["record_count"] > 0:
+                    collected.append(result)
+            except Exception:
+                # 跳过非等级报价结构的工作表
+                continue
+
+        self._activate_sheet(original_sheet)
+
+        merged_records: List[Dict[str, Any]] = []
+        merged_blocks: List[Dict[str, Any]] = []
+        merged_by_code: Dict[str, Any] = {}
+
+        for item in collected:
+            merged_records.extend(item.get("records", []))
+            merged_blocks.extend(item.get("blocks", []))
+
+            for code, node in item.get("by_product_code", {}).items():
+                if code not in merged_by_code:
+                    merged_by_code[code] = {
+                        "产品代码": code,
+                        "产品名称": node.get("产品名称", ""),
+                        "服务代码原文样本": node.get("服务代码原文样本", ""),
+                        "来源工作表": [item["meta"].get("sheet", "")],
+                        "国家分区报价": {},
+                    }
+
+                target = merged_by_code[code]
+                sheet_name = item["meta"].get("sheet", "")
+                if sheet_name and sheet_name not in target["来源工作表"]:
+                    target["来源工作表"].append(sheet_name)
+
+                for country, rows in node.get("国家分区报价", {}).items():
+                    target["国家分区报价"].setdefault(country, []).extend(rows)
+
+        return {
+            "meta": {
+                "excel": str(self.excel_path),
+                "mode": "all_sheets",
+                "scanned_sheet_count": len(target_sheets),
+                "matched_sheet_count": len(collected),
+                "matched_sheets": [x["meta"].get("sheet", "") for x in collected],
+                "record_count": len(merged_records),
+                "product_code_count": len(merged_by_code),
+                "block_count": len(merged_blocks),
+            },
+            "records": merged_records,
+            "by_product_code": merged_by_code,
+            "blocks": merged_blocks,
         }
 
 
@@ -621,6 +692,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="工作表名称",
     )
     parser.add_argument(
+        "--all-sheets",
+        action="store_true",
+        help="扫描并提取所有工作表中可识别的等级报价数据",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=Path("output") / "grade_quote_details.json",
@@ -650,6 +726,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     extractor = GradeQuoteExtractor(Path(args.input), sheet_name=args.sheet)
+    if args.all_sheets:
+        result = extractor.extract_all_sheets()
+        save_result(result, args.output_json, args.output_xlsx)
+
+        meta = result["meta"]
+        print("模式: all_sheets")
+        print(f"扫描工作表数: {meta['scanned_sheet_count']}")
+        print(f"命中工作表数: {meta['matched_sheet_count']}")
+        print(f"命中工作表: {', '.join(meta['matched_sheets'])}")
+        print(f"明细记录数: {meta['record_count']}")
+        print(f"产品代码数: {meta['product_code_count']}")
+        print(f"产品块数量: {meta['block_count']}")
+        print(f"JSON输出: {args.output_json}")
+        print(f"Excel输出: {args.output_xlsx}")
+        return
+
     result = extractor.extract()
 
     header_row = int(result["meta"]["header_row"])

@@ -507,9 +507,15 @@ class PricingExtractor:
     def save_snapshots_com(self, tables: List[ProductLineTable], output_dir: Path) -> List[Path]:
         return self._save_snapshots_via_excel_com(tables, output_dir)
 
-    def extract(self) -> List[ProductLineTable]:
+    def extract(self, include_sheets: Optional[List[str]] = None) -> List[ProductLineTable]:
         all_tables: List[ProductLineTable] = []
-        for ws in self.workbook.worksheets:
+        target_sheets = include_sheets or self.workbook.sheetnames
+        unknown = [s for s in target_sheets if s not in self.workbook.sheetnames]
+        if unknown:
+            raise ValueError(f"未找到工作表: {', '.join(unknown)}")
+
+        for sheet_name in target_sheets:
+            ws = self.workbook[sheet_name]
             merged_lookup = self._build_merged_lookup(ws)
             row = 1
             while row <= ws.max_row:
@@ -528,6 +534,30 @@ class PricingExtractor:
                     row += 1
 
         return all_tables
+
+
+def summarize_by_sheet(tables: List[ProductLineTable]) -> Dict[str, Dict[str, object]]:
+    summary: Dict[str, Dict[str, object]] = {}
+    for table in tables:
+        node = summary.setdefault(
+            table.sheet_name,
+            {
+                "sheet": table.sheet_name,
+                "table_count": 0,
+                "row_count": 0,
+                "product_codes": set(),
+            },
+        )
+        node["table_count"] = int(node["table_count"]) + 1
+        node["row_count"] = int(node["row_count"]) + len(table.rows)
+        for c in table.product_codes:
+            node["product_codes"].add(c)
+
+    for node in summary.values():
+        node["product_codes"] = sorted(list(node["product_codes"]))
+        node["product_code_count"] = len(node["product_codes"])
+
+    return summary
 
 
 def tables_to_records(tables: List[ProductLineTable]) -> List[Dict[str, object]]:
@@ -592,6 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="输入 Excel 文件路径",
     )
     parser.add_argument(
+        "--sheets",
+        type=str,
+        default="",
+        help="指定要查询的工作表，多个用逗号分隔；为空时扫描全部工作表",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=Path("output") / "pricing_details.json",
@@ -622,7 +658,11 @@ def main() -> None:
     args = build_parser().parse_args()
 
     extractor = PricingExtractor(args.input)
-    tables = extractor.extract()
+    include_sheets: Optional[List[str]] = None
+    if args.sheets.strip():
+        include_sheets = [x.strip() for x in args.sheets.split(",") if x.strip()]
+
+    tables = extractor.extract(include_sheets=include_sheets)
 
     write_outputs(tables, args.output_json, args.output_xlsx)
     if args.snapshot_engine == "com":
@@ -631,6 +671,12 @@ def main() -> None:
         snapshots = extractor.save_snapshots(tables, args.snapshot_dir)
 
     print(f"识别到产品线数量: {len(tables)}")
+    sheet_summary = summarize_by_sheet(tables)
+    print(f"命中工作表数量: {len(sheet_summary)}")
+    for sheet_name, info in sheet_summary.items():
+        print(
+            f"- {sheet_name}: 表格{info['table_count']}个, 数据行{info['row_count']}行, 产品代码{info['product_code_count']}个"
+        )
     for idx, table in enumerate(tables, start=1):
         codes = ",".join(table.product_codes) if table.product_codes else "(无代码)"
         print(

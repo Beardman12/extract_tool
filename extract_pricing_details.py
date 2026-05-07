@@ -16,8 +16,9 @@ import time
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import get_column_letter
@@ -75,7 +76,13 @@ class ProductLineTable:
 class PricingExtractor:
     def __init__(self, excel_path: Path):
         self.excel_path = excel_path
-        self.workbook = load_workbook(excel_path, data_only=True)
+        self._workbook = None
+
+    @property
+    def workbook(self):
+        if self._workbook is None:
+            self._workbook = load_workbook(self.excel_path, data_only=True)
+        return self._workbook
 
     @staticmethod
     def _norm_text(value: object) -> str:
@@ -114,6 +121,66 @@ class PricingExtractor:
             anchor_row, anchor_col = anchor
             return ws.cell(row=anchor_row, column=anchor_col).value
         return None
+
+    def default_index_file(self) -> Path:
+        return Path("output") / "index" / f"{self.excel_path.stem}_code_sheet_index.json"
+
+    def build_code_sheet_index(self) -> Dict[str, Any]:
+        code_to_sheets: Dict[str, set] = {}
+
+        idx_wb = load_workbook(self.excel_path, data_only=True, read_only=True)
+        try:
+            letter_re = re.compile(r"[A-Za-z]")
+            for ws in idx_wb.worksheets:
+                print(f"[索引] 扫描工作表: {ws.title}", flush=True)
+                for row in ws.iter_rows(values_only=True):
+                    for value in row:
+                        if value is None:
+                            continue
+                        text = str(value).strip()
+                        if not text:
+                            continue
+
+                        # 快速匹配规则：包含“出口易”且包含英文字母
+                        if "出口易" not in text or letter_re.search(text) is None:
+                            continue
+
+                        codes = self._extract_product_codes(text.upper())
+                        for code in codes:
+                            code_to_sheets.setdefault(code, set()).add(ws.title)
+        finally:
+            idx_wb.close()
+
+        normalized = {k: sorted(list(v)) for k, v in sorted(code_to_sheets.items())}
+        return {
+            "excel": str(self.excel_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "code_to_sheets": normalized,
+        }
+
+    @staticmethod
+    def load_code_sheet_index(index_file: Path) -> Dict[str, Any]:
+        return json.loads(index_file.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def save_code_sheet_index(index_file: Path, index_data: Dict[str, Any]) -> None:
+        index_file.parent.mkdir(parents=True, exist_ok=True)
+        index_file.write_text(json.dumps(index_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get_sheets_by_code(self, code: str, index_file: Path, rebuild: bool = False) -> List[str]:
+        if rebuild or not index_file.exists():
+            print(f"[索引] 开始构建目录文件: {index_file}", flush=True)
+            data = self.build_code_sheet_index()
+            self.save_code_sheet_index(index_file, data)
+            print(f"[索引] 目录构建完成: {index_file}", flush=True)
+        else:
+            print(f"[索引] 读取目录文件: {index_file}", flush=True)
+            data = self.load_code_sheet_index(index_file)
+
+        code_upper = code.strip().upper()
+        mapping = data.get("code_to_sheets", {})
+        sheets = mapping.get(code_upper, [])
+        return sorted({s for s in sheets})
 
     def _match_header_row(self, ws: Worksheet, row: int, merged_lookup: Dict[Tuple[int, int], Tuple[int, int]]) -> Optional[Tuple[int, List[str]]]:
         max_col = ws.max_column
@@ -628,6 +695,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="指定要查询的工作表，多个用逗号分隔；为空时扫描全部工作表",
     )
     parser.add_argument(
+        "--code",
+        type=str,
+        default="",
+        help="指定产品代码；会先通过产品代码-工作表目录进行匹配，只在匹配工作表执行",
+    )
+    parser.add_argument(
+        "--index-file",
+        type=Path,
+        default=None,
+        help="产品代码-工作表目录文件路径；为空时使用默认路径 output/index/<excel_stem>_code_sheet_index.json",
+    )
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help="强制重建产品代码-工作表目录文件",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=Path("output") / "pricing_details.json",
@@ -659,7 +743,24 @@ def main() -> None:
 
     extractor = PricingExtractor(args.input)
     include_sheets: Optional[List[str]] = None
-    if args.sheets.strip():
+
+    if args.code.strip():
+        index_file = args.index_file or extractor.default_index_file()
+        matched_sheets = extractor.get_sheets_by_code(
+            code=args.code,
+            index_file=index_file,
+            rebuild=args.rebuild_index,
+        )
+
+        if not matched_sheets:
+            print(f"产品代码 {args.code.strip().upper()} 匹配不到工作表，已停止执行。")
+            print(f"目录文件: {index_file}")
+            return
+
+        include_sheets = matched_sheets
+        print(f"产品代码 {args.code.strip().upper()} 匹配工作表: {', '.join(include_sheets)}")
+        print(f"目录文件: {index_file}")
+    elif args.sheets.strip():
         include_sheets = [x.strip() for x in args.sheets.split(",") if x.strip()]
 
     tables = extractor.extract(include_sheets=include_sheets)

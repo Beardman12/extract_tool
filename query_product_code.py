@@ -165,10 +165,29 @@ def query_promo(
     promo_file: Path,
     snapshot_engine: str,
     out_dir: Path,
+    index_file: Optional[Path] = None,
+    rebuild_index: bool = False,
 ) -> Dict[str, Any]:
     _log(f"[推广] 开始读取: {promo_file}")
+    _log("[推广] 初始化提取器...")
     extractor = PricingExtractor(promo_file)
-    tables = extractor.extract()
+    _log("[推广] 提取器初始化完成，开始目录匹配...")
+    promo_index_file = index_file or extractor.default_index_file()
+    matched_sheets = extractor.get_sheets_by_code(code=code, index_file=promo_index_file, rebuild=rebuild_index)
+    if not matched_sheets:
+        return {
+            "input_excel": str(promo_file),
+            "index_file": str(promo_index_file),
+            "matched_sheets": [],
+            "matched_count": 0,
+            "engine": snapshot_engine,
+            "snapshots": [],
+            "tables": [],
+            "message": f"产品代码 {code} 在推广报价中匹配不到工作表",
+        }
+
+    _log(f"[推广] 目录命中工作表: {', '.join(matched_sheets)}")
+    tables = extractor.extract(include_sheets=matched_sheets)
 
     matched = []
     for t in tables:
@@ -198,6 +217,8 @@ def query_promo(
 
     return {
         "input_excel": str(promo_file),
+        "index_file": str(promo_index_file),
+        "matched_sheets": matched_sheets,
         "matched_count": len(matched),
         "engine": used_engine,
         "snapshots": snapshots,
@@ -266,10 +287,15 @@ def apply_grade_to_promo(
     vip_records: List[Dict[str, Any]],
     snapshot_engine: str,
     out_dir: Path,
+    include_sheets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     _log(f"[覆盖] 开始按等级 {grade} 覆盖推广报价")
     source_extractor = PricingExtractor(promo_file)
-    tables = [t for t in source_extractor.extract() if code in [x.upper() for x in t.product_codes]]
+    tables = [
+        t
+        for t in source_extractor.extract(include_sheets=include_sheets)
+        if code in [x.upper() for x in t.product_codes]
+    ]
 
     update_logs: List[Dict[str, Any]] = []
     for table in tables:
@@ -352,7 +378,7 @@ def apply_grade_to_promo(
 
     # 用修改后的文件重新提取并截图，保证结构化数据和图片一致
     modified_extractor = PricingExtractor(modified_excel)
-    modified_tables_all = modified_extractor.extract()
+    modified_tables_all = modified_extractor.extract(include_sheets=include_sheets)
     modified_tables = [t for t in modified_tables_all if code in [x.upper() for x in t.product_codes]]
 
     snapshot_dir = out_dir / "promo_modified_snapshots"
@@ -409,6 +435,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("output") / "code_query",
         help="输出目录",
     )
+    parser.add_argument(
+        "--promo-index-file",
+        type=Path,
+        default=None,
+        help="推广报价产品代码-工作表目录文件路径；为空时使用默认路径",
+    )
+    parser.add_argument(
+        "--rebuild-promo-index",
+        action="store_true",
+        help="强制重建推广报价产品代码-工作表目录",
+    )
     return parser
 
 
@@ -432,7 +469,28 @@ def main() -> None:
 
     _log(f"[开始] 产品代码={code}, 等级={grade}, 截图引擎={args.snapshot_engine}")
 
-    promo_result = query_promo(code, promo_file, args.snapshot_engine, out_dir)
+    promo_result = query_promo(
+        code,
+        promo_file,
+        args.snapshot_engine,
+        out_dir,
+        index_file=args.promo_index_file,
+        rebuild_index=args.rebuild_promo_index,
+    )
+
+    if promo_result.get("matched_count", 0) <= 0:
+        payload = {
+            "产品代码": code,
+            "等级": grade,
+            "推广报价": promo_result,
+            "message": f"产品代码 {code} 在推广报价中匹配不到工作表，已停止后续执行。",
+        }
+        output_json = out_dir / f"{code}_query_result.json"
+        output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _log(payload["message"])
+        _log(f"输出JSON: {output_json}")
+        return
+
     vip_result = query_vip(code, grade, vip_file, args.snapshot_engine, out_dir)
     modified_result = apply_grade_to_promo(
         code=code,
@@ -441,6 +499,7 @@ def main() -> None:
         vip_records=vip_result["records"],
         snapshot_engine=args.snapshot_engine,
         out_dir=out_dir,
+        include_sheets=promo_result.get("matched_sheets"),
     )
 
     payload = {
@@ -456,6 +515,8 @@ def main() -> None:
 
     print(f"产品代码: {code}")
     print(f"等级: {grade}")
+    print(f"推广索引文件: {promo_result.get('index_file', '')}")
+    print(f"推广命中工作表: {', '.join(promo_result.get('matched_sheets', []))}")
     print(f"推广报价匹配: {promo_result['matched_count']}")
     print(f"VIP记录匹配: {vip_result['matched_record_count']}")
     print(f"VIP块匹配: {vip_result['matched_block_count']}")

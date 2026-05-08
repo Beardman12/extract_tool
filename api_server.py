@@ -317,6 +317,7 @@ def get_vip_options(
 @app.post("/api/query/run")
 def run_query(req: RunQueryRequest, request: Request):
     logger = get_logger()
+    t_total = time.perf_counter()
     code = req.code.strip().upper()
     grade = req.grade.strip().upper()
 
@@ -351,6 +352,7 @@ def run_query(req: RunQueryRequest, request: Request):
         cmd.append("--rebuild-vip-structured-json")
 
     logger.info("执行查询命令: %s", " ".join(cmd))
+    t = time.perf_counter()
     completed = subprocess.run(
         cmd,
         cwd=str(WORKSPACE),
@@ -359,14 +361,34 @@ def run_query(req: RunQueryRequest, request: Request):
         encoding="utf-8",
         errors="replace",
     )
+    subprocess_ms = int((time.perf_counter() - t) * 1000)
 
     output_json = OUTPUT_DIR / "code_query" / code / f"{code}_query_result.json"
     payload: Optional[Dict[str, Any]] = None
+    t = time.perf_counter()
     if output_json.exists():
         payload = json.loads(output_json.read_text(encoding="utf-8"))
+    load_json_ms = int((time.perf_counter() - t) * 1000)
 
+    t = time.perf_counter()
     output_json_url = _path_to_public_url(str(output_json), request)
     image_urls = _collect_image_urls(payload, request) if payload else []
+    build_urls_ms = int((time.perf_counter() - t) * 1000)
+    total_ms = int((time.perf_counter() - t_total) * 1000)
+
+    timing_ms = {
+        "subprocess_run": subprocess_ms,
+        "load_result_json": load_json_ms,
+        "build_public_urls": build_urls_ms,
+        "total": total_ms,
+    }
+    logger.info(
+        "查询接口耗时(ms): subprocess=%s load_json=%s build_urls=%s total=%s",
+        subprocess_ms,
+        load_json_ms,
+        build_urls_ms,
+        total_ms,
+    )
 
     return {
         "command": cmd,
@@ -376,6 +398,7 @@ def run_query(req: RunQueryRequest, request: Request):
         "output_json": str(output_json),
         "output_json_url": output_json_url,
         "image_urls": image_urls,
+        "timing_ms": timing_ms,
         "result": payload,
     }
 

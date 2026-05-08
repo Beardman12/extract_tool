@@ -15,6 +15,7 @@ import re
 import shutil
 import traceback
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
@@ -25,6 +26,10 @@ from grade_quote_extractor import GradeQuoteExtractor, ProductCodeBlock
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _ms(start: float) -> int:
+    return int((perf_counter() - start) * 1000)
 
 
 def _find_first_xlsx(workspace: Path, keyword: str) -> Optional[Path]:
@@ -323,13 +328,23 @@ def query_promo(
     index_file: Optional[Path] = None,
     rebuild_index: bool = False,
 ) -> Dict[str, Any]:
+    promo_total_start = perf_counter()
+    init_start = perf_counter()
     _log(f"[推广] 开始读取: {promo_file}")
     _log("[推广] 初始化提取器...")
     extractor = PricingExtractor(promo_file)
+    init_ms = _ms(init_start)
+    _log(f"[推广] 提取器初始化耗时: {init_ms}ms")
+
+    index_start = perf_counter()
     _log("[推广] 提取器初始化完成，开始目录匹配...")
     promo_index_file = index_file or extractor.default_index_file()
     matched_sheets = extractor.get_sheets_by_code(code=code, index_file=promo_index_file, rebuild=rebuild_index)
+    index_ms = _ms(index_start)
+    _log(f"[推广] 目录匹配耗时: {index_ms}ms")
+
     if not matched_sheets:
+        total_ms = _ms(promo_total_start)
         return {
             "input_excel": str(promo_file),
             "index_file": str(promo_index_file),
@@ -339,25 +354,41 @@ def query_promo(
             "snapshots": [],
             "tables": [],
             "message": f"产品代码 {code} 在推广报价中匹配不到工作表",
+            "timing_ms": {
+                "init_extractor": init_ms,
+                "match_index": index_ms,
+                "extract_tables": 0,
+                "filter_tables": 0,
+                "snapshot": 0,
+                "total": total_ms,
+            },
         }
 
     _log(f"[推广] 目录命中工作表: {', '.join(matched_sheets)}")
+    extract_start = perf_counter()
     tables = extractor.extract(include_sheets=matched_sheets)
+    extract_ms = _ms(extract_start)
+    _log(f"[推广] 工作表提取耗时: {extract_ms}ms")
 
+    filter_start = perf_counter()
     matched = []
-    for t in tables:
-        codes = [c.upper() for c in t.product_codes]
+    for table in tables:
+        codes = [c.upper() for c in table.product_codes]
         if code in codes:
-            matched.append(t)
+            matched.append(table)
+    filter_ms = _ms(filter_start)
+    _log(f"[推广] 代码过滤耗时: {filter_ms}ms")
 
-    debug_codes = sorted({c.upper() for t in tables for c in t.product_codes})
+    debug_codes = sorted({c.upper() for table in tables for c in table.product_codes})
 
     snapshot_dir = out_dir / "promo_snapshots"
     snapshots: List[str] = []
     used_engine = snapshot_engine
+    snapshot_ms = 0
 
     if matched:
         _log(f"[推广] 命中产品线数量: {len(matched)}，开始生成截图（{snapshot_engine}）")
+        snapshot_start = perf_counter()
         if snapshot_engine == "com":
             try:
                 paths = extractor.save_snapshots_com(matched, snapshot_dir)
@@ -369,8 +400,11 @@ def query_promo(
             paths = extractor.save_snapshots(matched, snapshot_dir)
 
         snapshots = [str(p) for p in paths]
+        snapshot_ms = _ms(snapshot_start)
+        _log(f"[推广] 截图耗时: {snapshot_ms}ms")
 
-    _log(f"[推广] 完成，匹配 {len(matched)}，截图 {len(snapshots)}")
+    total_ms = _ms(promo_total_start)
+    _log(f"[推广] 完成，匹配 {len(matched)}，截图 {len(snapshots)}，总耗时 {total_ms}ms")
 
     message = ""
     if not matched:
@@ -391,8 +425,16 @@ def query_promo(
         "matched_count": len(matched),
         "engine": used_engine,
         "snapshots": snapshots,
-        "tables": [_promo_table_to_dict(t) for t in matched],
+        "tables": [_promo_table_to_dict(table) for table in matched],
         "message": message,
+        "timing_ms": {
+            "init_extractor": init_ms,
+            "match_index": index_ms,
+            "extract_tables": extract_ms,
+            "filter_tables": filter_ms,
+            "snapshot": snapshot_ms,
+            "total": total_ms,
+        },
     }
 
 
@@ -405,11 +447,14 @@ def query_vip(
     structured_json: Optional[Path] = None,
     rebuild_structured_json: bool = False,
 ) -> Dict[str, Any]:
+    vip_total_start = perf_counter()
     _log(f"[VIP] 开始读取: {vip_file}")
 
     structured_file = structured_json or _default_vip_structured_json(vip_file)
     result: Dict[str, Any]
+    structured_prepare_ms = 0
 
+    structured_prepare_start = perf_counter()
     if rebuild_structured_json or not structured_file.exists():
         _log(f"[VIP] 开始解析Excel并生成结构化JSON: {structured_file}")
         extractor_for_extract = GradeQuoteExtractor(vip_file, sheet_name="等级报价")
@@ -420,7 +465,10 @@ def query_vip(
     else:
         _log(f"[VIP] 使用已有结构化JSON: {structured_file}")
         result = json.loads(structured_file.read_text(encoding="utf-8"))
+    structured_prepare_ms = _ms(structured_prepare_start)
+    _log(f"[VIP] 结构化数据准备耗时: {structured_prepare_ms}ms")
 
+    blocks_prepare_start = perf_counter()
     extractor = GradeQuoteExtractor(vip_file, sheet_name="等级报价")
 
     records = [r for r in result["records"] if str(r.get("产品代码", "")).upper() == code]
@@ -442,9 +490,12 @@ def query_vip(
 
     header_row = int(result["meta"]["header_row"])
     cm = extractor._build_column_map(header_row)
+    prepare_blocks_ms = _ms(blocks_prepare_start)
+    _log(f"[VIP] 代码筛选与块准备耗时: {prepare_blocks_ms}ms")
 
     snapshot_dir = out_dir / "vip_snapshots"
     _log(f"[VIP] 命中记录 {len(records)}，命中块 {len(blocks_for_code)}，开始生成截图（{snapshot_engine}）")
+    snapshot_start = perf_counter()
     snapshot_items = extractor.save_block_snapshots(
         blocks=blocks_for_code,
         header_row=header_row,
@@ -452,8 +503,11 @@ def query_vip(
         output_dir=snapshot_dir,
         engine=snapshot_engine,
     )
+    snapshot_ms = _ms(snapshot_start)
+    _log(f"[VIP] 截图耗时: {snapshot_ms}ms")
 
-    _log(f"[VIP] 完成，截图 {len(snapshot_items)}")
+    total_ms = _ms(vip_total_start)
+    _log(f"[VIP] 完成，截图 {len(snapshot_items)}，总耗时 {total_ms}ms")
 
     return {
         "input_excel": str(vip_file),
@@ -464,6 +518,12 @@ def query_vip(
         "records": records,
         "by_product_code": by_code,
         "snapshots": snapshot_items,
+        "timing_ms": {
+            "prepare_structured": structured_prepare_ms,
+            "prepare_blocks": prepare_blocks_ms,
+            "snapshot": snapshot_ms,
+            "total": total_ms,
+        },
     }
 
 
@@ -476,14 +536,19 @@ def apply_grade_to_promo(
     out_dir: Path,
     include_sheets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    apply_total_start = perf_counter()
     _log(f"[覆盖] 开始按等级 {grade} 覆盖推广报价")
+    extract_source_start = perf_counter()
     source_extractor = PricingExtractor(promo_file)
     tables = [
-        t
-        for t in source_extractor.extract(include_sheets=include_sheets)
-        if code in [x.upper() for x in t.product_codes]
+        table_item
+        for table_item in source_extractor.extract(include_sheets=include_sheets)
+        if code in [x.upper() for x in table_item.product_codes]
     ]
+    extract_source_ms = _ms(extract_source_start)
+    _log(f"[覆盖] 原始表提取耗时: {extract_source_ms}ms")
 
+    match_rows_start = perf_counter()
     update_logs: List[Dict[str, Any]] = []
     for table in tables:
         for row in table.rows:
@@ -539,8 +604,11 @@ def apply_grade_to_promo(
                     "匹配VIP重量段KG": matched_vip_weight,
                 }
             )
+    match_rows_ms = _ms(match_rows_start)
+    _log(f"[覆盖] 行匹配与更新计算耗时: {match_rows_ms}ms")
 
     # 在复制文件上覆盖值，保留原文件不变
+    write_excel_start = perf_counter()
     modified_excel = out_dir / f"{code}_promo_modified_by_{grade}.xlsx"
     shutil.copy2(promo_file, modified_excel)
     wb = load_workbook(modified_excel)
@@ -550,9 +618,9 @@ def apply_grade_to_promo(
         row_no = int(log["row"])
 
         target_table = None
-        for t in tables:
-            if t.sheet_name == log["sheet"] and t.product_line == log["产品线"]:
-                target_table = t
+        for table_item in tables:
+            if table_item.sheet_name == log["sheet"] and table_item.product_line == log["产品线"]:
+                target_table = table_item
                 break
         if target_table is None:
             continue
@@ -564,16 +632,22 @@ def apply_grade_to_promo(
         ws.cell(row=row_no, column=handling_col).value = log["新处理费"]
 
     wb.save(modified_excel)
+    write_excel_ms = _ms(write_excel_start)
+    _log(f"[覆盖] 覆盖写回Excel耗时: {write_excel_ms}ms")
     _log(f"[覆盖] 已写入覆盖结果Excel: {modified_excel}")
 
     # 用修改后的文件重新提取并截图，保证结构化数据和图片一致
+    reextract_start = perf_counter()
     modified_extractor = PricingExtractor(modified_excel)
     modified_tables_all = modified_extractor.extract(include_sheets=include_sheets)
-    modified_tables = [t for t in modified_tables_all if code in [x.upper() for x in t.product_codes]]
+    modified_tables = [table_item for table_item in modified_tables_all if code in [x.upper() for x in table_item.product_codes]]
+    reextract_ms = _ms(reextract_start)
+    _log(f"[覆盖] 覆盖后表提取耗时: {reextract_ms}ms")
 
     snapshot_dir = out_dir / "promo_modified_snapshots"
     used_engine = snapshot_engine
     _log(f"[覆盖] 开始生成覆盖后截图（{snapshot_engine}）")
+    snapshot_start = perf_counter()
     if snapshot_engine == "com":
         try:
             snap_paths = modified_extractor.save_snapshots_com(modified_tables, snapshot_dir)
@@ -583,17 +657,28 @@ def apply_grade_to_promo(
             snap_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
     else:
         snap_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
+    snapshot_ms = _ms(snapshot_start)
+    _log(f"[覆盖] 截图耗时: {snapshot_ms}ms")
 
-    _log(f"[覆盖] 完成，截图 {len(snap_paths)}")
+    total_ms = _ms(apply_total_start)
+    _log(f"[覆盖] 完成，截图 {len(snap_paths)}，总耗时 {total_ms}ms")
 
     return {
         "grade": grade,
         "modified_excel": str(modified_excel),
         "matched_table_count": len(modified_tables),
         "update_logs": update_logs,
-        "modified_tables": [_promo_table_to_dict(t) for t in modified_tables],
+        "modified_tables": [_promo_table_to_dict(table_item) for table_item in modified_tables],
         "snapshots": [str(p) for p in snap_paths],
         "engine": used_engine,
+        "timing_ms": {
+            "extract_source": extract_source_ms,
+            "match_rows": match_rows_ms,
+            "write_excel": write_excel_ms,
+            "reextract_modified": reextract_ms,
+            "snapshot": snapshot_ms,
+            "total": total_ms,
+        },
     }
 
 
@@ -657,6 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    main_total_start = perf_counter()
     args = build_parser().parse_args()
     _load_country_match_rules(args.country_match_config)
     code = _normalize_code(args.code)
@@ -677,6 +763,7 @@ def main() -> None:
 
     _log(f"[开始] 产品代码={code}, 等级={grade}, 截图引擎={args.snapshot_engine}")
 
+    promo_stage_start = perf_counter()
     promo_result = query_promo(
         code,
         promo_file,
@@ -685,6 +772,8 @@ def main() -> None:
         index_file=args.promo_index_file,
         rebuild_index=args.rebuild_promo_index,
     )
+    promo_ms = _ms(promo_stage_start)
+    _log(f"[耗时] 推广阶段总耗时: {promo_ms}ms")
 
     if promo_result.get("matched_count", 0) <= 0:
         stop_message = promo_result.get("message") or f"产品代码 {code} 在推广报价中匹配不到工作表，已停止后续执行。"
@@ -693,13 +782,21 @@ def main() -> None:
             "等级": grade,
             "推广报价": promo_result,
             "message": stop_message,
+            "timing_ms": {
+                "promo": promo_ms,
+                "vip": 0,
+                "apply_grade": 0,
+                "total": _ms(main_total_start),
+            },
         }
         output_json = out_dir / f"{code}_query_result.json"
         output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         _log(payload["message"])
         _log(f"输出JSON: {output_json}")
+        _log(f"[耗时] 总耗时: {_ms(main_total_start)}ms")
         return
 
+    vip_stage_start = perf_counter()
     vip_result = query_vip(
         code,
         grade,
@@ -709,6 +806,10 @@ def main() -> None:
         structured_json=args.vip_structured_json,
         rebuild_structured_json=args.rebuild_vip_structured_json,
     )
+    vip_ms = _ms(vip_stage_start)
+    _log(f"[耗时] VIP阶段总耗时: {vip_ms}ms")
+
+    apply_stage_start = perf_counter()
     modified_result = apply_grade_to_promo(
         code=code,
         grade=grade,
@@ -718,6 +819,10 @@ def main() -> None:
         out_dir=out_dir,
         include_sheets=promo_result.get("matched_sheets"),
     )
+    apply_ms = _ms(apply_stage_start)
+    _log(f"[耗时] 覆盖阶段总耗时: {apply_ms}ms")
+
+    total_ms = _ms(main_total_start)
 
     payload = {
         "产品代码": code,
@@ -725,6 +830,12 @@ def main() -> None:
         "推广报价": promo_result,
         "VIP等级报价": vip_result,
         "推广报价_按等级覆盖后": modified_result,
+        "timing_ms": {
+            "promo": promo_ms,
+            "vip": vip_ms,
+            "apply_grade": apply_ms,
+            "total": total_ms,
+        },
     }
 
     output_json = out_dir / f"{code}_query_result.json"
@@ -738,6 +849,7 @@ def main() -> None:
     print(f"VIP记录匹配: {vip_result['matched_record_count']}")
     print(f"VIP块匹配: {vip_result['matched_block_count']}")
     print(f"覆盖后推广表匹配: {modified_result['matched_table_count']}")
+    print(f"耗时(推广/VIP/覆盖/总计, ms): {promo_ms}/{vip_ms}/{apply_ms}/{total_ms}")
     print(f"输出JSON: {output_json}")
     print(f"推广截图目录: {out_dir / 'promo_snapshots'}")
     print(f"VIP截图目录: {out_dir / 'vip_snapshots'}")

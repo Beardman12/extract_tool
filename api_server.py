@@ -11,9 +11,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from extract_pricing_details import PricingExtractor
@@ -94,6 +96,64 @@ def _default_vip_structured_json(vip_file: Path) -> Path:
     return CACHE_DIR / f"{vip_file.stem}_vip_structured.json"
 
 
+def _path_to_public_url(path_str: str, request: Request) -> Optional[str]:
+    if not path_str:
+        return None
+
+    raw = path_str.replace("\\", "/").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("output/"):
+        rel = raw
+    else:
+        p = Path(raw)
+        if p.is_absolute():
+            try:
+                rel = p.resolve().relative_to(WORKSPACE.resolve()).as_posix()
+            except Exception:
+                return None
+            if not rel.startswith("output/"):
+                return None
+        else:
+            rel = raw
+            if not rel.startswith("output/"):
+                return None
+
+    encoded = "/".join(quote(seg) for seg in rel.split("/"))
+    return f"{request.base_url}{encoded}".rstrip("/")
+
+
+def _collect_image_urls(node: Any, request: Request) -> List[str]:
+    urls: List[str] = []
+
+    def visit(x: Any) -> None:
+        if isinstance(x, dict):
+            for v in x.values():
+                visit(v)
+            return
+        if isinstance(x, list):
+            for v in x:
+                visit(v)
+            return
+        if isinstance(x, str):
+            low = x.lower()
+            if low.endswith(".png") or low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".webp"):
+                u = _path_to_public_url(x, request)
+                if u:
+                    urls.append(u)
+
+    visit(node)
+    # 去重并保持顺序
+    dedup: List[str] = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    return dedup
+
+
 def _ensure_vip_structured_json(
     vip_file: Path,
     structured_json: Optional[str],
@@ -132,6 +192,9 @@ class RunQueryRequest(BaseModel):
 
 
 app = FastAPI(title="AI Price API", version="1.0.0")
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 
 app.add_middleware(
     CORSMiddleware,
@@ -252,7 +315,7 @@ def get_vip_options(
 
 
 @app.post("/api/query/run")
-def run_query(req: RunQueryRequest):
+def run_query(req: RunQueryRequest, request: Request):
     logger = get_logger()
     code = req.code.strip().upper()
     grade = req.grade.strip().upper()
@@ -302,12 +365,17 @@ def run_query(req: RunQueryRequest):
     if output_json.exists():
         payload = json.loads(output_json.read_text(encoding="utf-8"))
 
+    output_json_url = _path_to_public_url(str(output_json), request)
+    image_urls = _collect_image_urls(payload, request) if payload else []
+
     return {
         "command": cmd,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "output_json": str(output_json),
+        "output_json_url": output_json_url,
+        "image_urls": image_urls,
         "result": payload,
     }
 

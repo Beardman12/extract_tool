@@ -147,6 +147,9 @@ class PricingExtractor:
         try:
             letter_re = re.compile(r"[A-Za-z]")
             for ws in idx_wb.worksheets:
+                if ws.title.strip() == "总目录":
+                    print(f"[索引] 跳过工作表: {ws.title}", flush=True)
+                    continue
                 print(f"[索引] 扫描工作表: {ws.title}", flush=True)
                 for row in ws.iter_rows(values_only=True):
                     for value in row:

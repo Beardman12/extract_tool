@@ -11,3 +11,4 @@ wheels/
 output/
 源文件/
 *.xlsx
+logs/

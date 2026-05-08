@@ -11,6 +11,10 @@
     {
       "promo_contains": ["秘鲁-非利马区域", "秘鲁非利马区域", "非利马区域"],
       "vip_tokens": ["PE2"]
+    },
+    {
+      "promo_contains": ["哥伦比亚"],
+      "vip_tokens": ["CO"]
     }
   ]
 }

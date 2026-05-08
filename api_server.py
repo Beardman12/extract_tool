@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -152,6 +153,18 @@ def _collect_image_urls(node: Any, request: Request) -> List[str]:
             seen.add(u)
             dedup.append(u)
     return dedup
+
+
+def _decode_process_text(data: bytes) -> str:
+    if not data:
+        return ""
+
+    for enc in ("utf-8", "gb18030", "cp936"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _ensure_vip_structured_json(
@@ -353,15 +366,19 @@ def run_query(req: RunQueryRequest, request: Request):
 
     logger.info("执行查询命令: %s", " ".join(cmd))
     t = time.perf_counter()
+    child_env = os.environ.copy()
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    child_env.setdefault("PYTHONUTF8", "1")
     completed = subprocess.run(
         cmd,
         cwd=str(WORKSPACE),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        text=False,
+        env=child_env,
     )
     subprocess_ms = int((time.perf_counter() - t) * 1000)
+    stdout_text = _decode_process_text(completed.stdout)
+    stderr_text = _decode_process_text(completed.stderr)
 
     output_json = OUTPUT_DIR / "code_query" / code / f"{code}_query_result.json"
     payload: Optional[Dict[str, Any]] = None
@@ -393,8 +410,8 @@ def run_query(req: RunQueryRequest, request: Request):
     return {
         "command": cmd,
         "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
         "output_json": str(output_json),
         "output_json_url": output_json_url,
         "image_urls": image_urls,

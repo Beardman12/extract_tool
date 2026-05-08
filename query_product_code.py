@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import traceback
 from pathlib import Path
@@ -48,6 +49,62 @@ def _normalize_text(text: Any) -> str:
     return s
 
 
+# 国家匹配可配置规则：支持“推广国家名称 -> VIP分区代码/包含字符串”手动维护。
+DEFAULT_COUNTRY_MATCH_RULES: List[Dict[str, List[str]]] = [
+    {
+        "promo_contains": ["美国"],
+        "vip_tokens": ["US", "US1", "US2"],
+    },
+    {
+        "promo_contains": ["秘鲁-利马区域", "秘鲁利马区域", "利马区域"],
+        "vip_tokens": ["PE1"],
+    },
+    {
+        "promo_contains": ["秘鲁-非利马区域", "秘鲁非利马区域", "非利马区域"],
+        "vip_tokens": ["PE2"],
+    },
+]
+
+COUNTRY_MATCH_RULES: List[Dict[str, List[str]]] = list(DEFAULT_COUNTRY_MATCH_RULES)
+
+
+def _load_country_match_rules(config_file: Optional[Path]) -> None:
+    global COUNTRY_MATCH_RULES
+
+    if config_file is None:
+        COUNTRY_MATCH_RULES = list(DEFAULT_COUNTRY_MATCH_RULES)
+        return
+
+    if not config_file.exists():
+        COUNTRY_MATCH_RULES = list(DEFAULT_COUNTRY_MATCH_RULES)
+        _log(f"[配置] 未找到国家匹配配置文件，使用内置规则: {config_file}")
+        return
+
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    rules = raw.get("rules") if isinstance(raw, dict) else raw
+    if not isinstance(rules, list):
+        raise ValueError("国家匹配配置文件格式错误：应为 rules 列表或列表根节点")
+
+    normalized_rules: List[Dict[str, List[str]]] = []
+    for idx, item in enumerate(rules, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"国家匹配配置第 {idx} 条不是对象")
+        promo_contains = item.get("promo_contains", [])
+        vip_tokens = item.get("vip_tokens", [])
+        if not isinstance(promo_contains, list) or not isinstance(vip_tokens, list):
+            raise ValueError(f"国家匹配配置第 {idx} 条格式错误：promo_contains/vip_tokens 必须为数组")
+
+        pc = [str(x).strip() for x in promo_contains if str(x).strip()]
+        vt = [str(x).strip() for x in vip_tokens if str(x).strip()]
+        if not pc or not vt:
+            continue
+
+        normalized_rules.append({"promo_contains": pc, "vip_tokens": vt})
+
+    COUNTRY_MATCH_RULES = normalized_rules or list(DEFAULT_COUNTRY_MATCH_RULES)
+    _log(f"[配置] 已加载国家匹配规则: {len(COUNTRY_MATCH_RULES)} 条（{config_file}）")
+
+
 def _is_empty_value(v: Any) -> bool:
     return v is None or str(v).strip() == ""
 
@@ -59,9 +116,48 @@ def _is_follow_public(v: Any) -> bool:
 def _split_country_zone(zone: str) -> List[str]:
     if not zone:
         return []
-    tmp = zone.replace("\n", ",").replace("，", ",").replace("/", ",").replace(";", ",")
-    tokens = [t.strip().upper() for t in tmp.split(",") if t.strip()]
+    tmp = zone.replace("\n", ",")
+    raw_tokens = [t.strip() for t in re.split(r"[,，/;；、|]+", tmp) if t.strip()]
+    tokens: List[str] = []
+    for t in raw_tokens:
+        # 去掉括号备注，避免“US2（财务务必两个都设置）”干扰匹配。
+        cleaned = re.sub(r"[（(].*?[)）]", "", t).strip()
+        if not cleaned:
+            cleaned = t.strip()
+        if cleaned:
+            tokens.append(cleaned.upper())
     return tokens
+
+
+def _get_config_vip_tokens(promo_country: str) -> List[str]:
+    promo_norm = _normalize_text(promo_country)
+    if not promo_norm:
+        return []
+
+    out: set[str] = set()
+    for rule in COUNTRY_MATCH_RULES:
+        contains_keys = [_normalize_text(x) for x in rule.get("promo_contains", [])]
+        if any(k and k in promo_norm for k in contains_keys):
+            for t in rule.get("vip_tokens", []):
+                tn = _normalize_text(t)
+                if tn:
+                    out.add(tn)
+    return sorted(out)
+
+
+def _zone_token_match_alias(token_norm: str, alias_norm: str) -> bool:
+    if not token_norm or not alias_norm:
+        return False
+
+    if token_norm == alias_norm:
+        return True
+
+    # 短英文代码做前缀数字匹配，如 US -> US1/US2。
+    if re.fullmatch(r"[A-Z]{2,3}", alias_norm):
+        return re.fullmatch(rf"{re.escape(alias_norm)}\d*", token_norm) is not None
+
+    # 长代码允许双向包含，兼容“秘鲁-利马区域”等文本型匹配。
+    return alias_norm in token_norm or token_norm in alias_norm
 
 
 def _country_aliases(country: str) -> List[str]:
@@ -79,6 +175,9 @@ def _country_aliases(country: str) -> List[str]:
     for k, vals in mapping.items():
         if k in country:
             aliases.update(vals)
+
+    # 可配置映射：推广国家名 -> VIP分区代码。
+    aliases.update(_get_config_vip_tokens(country))
     return list(aliases)
 
 
@@ -94,9 +193,7 @@ def _country_match(promo_country: str, zone_text: str) -> bool:
 
     for token in tokens:
         token_norm = _normalize_text(token)
-        if token_norm in aliases:
-            return True
-        if any(a in token_norm or token_norm in a for a in aliases):
+        if any(_zone_token_match_alias(token_norm, _normalize_text(a)) for a in aliases):
             return True
     return False
 
@@ -109,31 +206,85 @@ def _select_grade_fee(vip_record: Dict[str, Any], grade: str) -> Tuple[Any, Any]
     return data.get("运费"), data.get("处理费")
 
 
-def _pick_best_vip_record(promo_country: str, promo_weight: str, vip_records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    w_norm = _normalize_text(promo_weight)
-    if not w_norm:
+def _strip_parenthesized(text: str) -> str:
+    return re.sub(r"[（(].*?[)）]", "", text)
+
+
+def _parse_weight_range(text: Any) -> Optional[Tuple[float, float]]:
+    if text is None:
         return None
 
-    exact: List[Dict[str, Any]] = []
-    all_country: List[Dict[str, Any]] = []
+    s = str(text).strip()
+    if not s:
+        return None
+
+    s = _strip_parenthesized(s)
+    s = s.replace("KG", "").replace("kg", "")
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+    if len(nums) < 2:
+        return None
+
+    low = float(nums[0])
+    high = float(nums[1])
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _weight_match(promo_weight: str, vip_weight: str, tol: float = 0.02) -> bool:
+    p_norm = _normalize_text(promo_weight)
+    v_norm = _normalize_text(vip_weight)
+    if p_norm and p_norm == v_norm:
+        return True
+
+    p_range = _parse_weight_range(promo_weight)
+    v_range = _parse_weight_range(vip_weight)
+    if p_range is None or v_range is None:
+        return False
+
+    p_low, p_high = p_range
+    v_low, v_high = v_range
+    return abs(p_low - v_low) <= tol and abs(p_high - v_high) <= tol
+
+
+def _weight_distance(promo_weight: str, vip_weight: str) -> float:
+    p_range = _parse_weight_range(promo_weight)
+    v_range = _parse_weight_range(vip_weight)
+    if p_range is None or v_range is None:
+        return 9999.0
+    p_low, p_high = p_range
+    v_low, v_high = v_range
+    return abs(p_low - v_low) + abs(p_high - v_high)
+
+
+def _pick_best_vip_record(promo_country: str, promo_weight: str, vip_records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not str(promo_weight).strip():
+        return None
+
+    exact: List[Tuple[float, Dict[str, Any]]] = []
+    all_country: List[Tuple[float, Dict[str, Any]]] = []
 
     for rec in vip_records:
-        rec_weight = _normalize_text(rec.get("重量段KG", ""))
-        if rec_weight != w_norm:
+        rec_weight_text = str(rec.get("重量段KG", ""))
+        if not _weight_match(promo_weight, rec_weight_text):
             continue
+
+        score = _weight_distance(promo_weight, rec_weight_text)
 
         zone = str(rec.get("国家分区", ""))
         if "所有国家" in _normalize_text(zone):
-            all_country.append(rec)
+            all_country.append((score, rec))
             continue
 
         if _country_match(promo_country, zone):
-            exact.append(rec)
+            exact.append((score, rec))
 
     if exact:
-        return exact[0]
+        exact.sort(key=lambda x: x[0])
+        return exact[0][1]
     if all_country:
-        return all_country[0]
+        all_country.sort(key=lambda x: x[0])
+        return all_country[0][1]
     return None
 
 
@@ -158,6 +309,10 @@ def _promo_table_to_dict(table: ProductLineTable) -> Dict[str, Any]:
         },
         "rows": table.rows,
     }
+
+
+def _default_vip_structured_json(vip_file: Path) -> Path:
+    return Path("output") / "cache" / f"{vip_file.stem}_vip_structured.json"
 
 
 def query_promo(
@@ -247,10 +402,26 @@ def query_vip(
     vip_file: Path,
     snapshot_engine: str,
     out_dir: Path,
+    structured_json: Optional[Path] = None,
+    rebuild_structured_json: bool = False,
 ) -> Dict[str, Any]:
     _log(f"[VIP] 开始读取: {vip_file}")
+
+    structured_file = structured_json or _default_vip_structured_json(vip_file)
+    result: Dict[str, Any]
+
+    if rebuild_structured_json or not structured_file.exists():
+        _log(f"[VIP] 开始解析Excel并生成结构化JSON: {structured_file}")
+        extractor_for_extract = GradeQuoteExtractor(vip_file, sheet_name="等级报价")
+        result = extractor_for_extract.extract()
+        structured_file.parent.mkdir(parents=True, exist_ok=True)
+        structured_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        _log(f"[VIP] 结构化JSON已生成: {structured_file}")
+    else:
+        _log(f"[VIP] 使用已有结构化JSON: {structured_file}")
+        result = json.loads(structured_file.read_text(encoding="utf-8"))
+
     extractor = GradeQuoteExtractor(vip_file, sheet_name="等级报价")
-    result = extractor.extract()
 
     records = [r for r in result["records"] if str(r.get("产品代码", "")).upper() == code]
     by_code = result["by_product_code"].get(code)
@@ -286,6 +457,7 @@ def query_vip(
 
     return {
         "input_excel": str(vip_file),
+        "structured_json": str(structured_file),
         "grade": grade,
         "matched_record_count": len(records),
         "matched_block_count": len(blocks_for_code),
@@ -327,10 +499,12 @@ def apply_grade_to_promo(
             new_h = ""
             status = "unmatched_blank"
             matched_zone = ""
+            matched_vip_weight = ""
 
             if rec is not None:
                 fee_f, fee_h = _select_grade_fee(rec, grade)
                 matched_zone = str(rec.get("国家分区", ""))
+                matched_vip_weight = str(rec.get("重量段KG", ""))
                 status = "matched"
 
                 if _is_follow_public(fee_f):
@@ -362,6 +536,7 @@ def apply_grade_to_promo(
                     "新处理费": new_h,
                     "匹配状态": status,
                     "匹配国家分区": matched_zone,
+                    "匹配VIP重量段KG": matched_vip_weight,
                 }
             )
 
@@ -457,6 +632,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="推广报价产品代码-工作表目录文件路径；为空时使用默认路径",
     )
     parser.add_argument(
+        "--vip-structured-json",
+        type=Path,
+        default=None,
+        help="VIP价格设置结构化JSON路径；存在则直接复用，不存在时自动生成",
+    )
+    parser.add_argument(
+        "--rebuild-vip-structured-json",
+        action="store_true",
+        help="强制重建VIP价格设置结构化JSON",
+    )
+    parser.add_argument(
+        "--country-match-config",
+        type=Path,
+        default=Path("country_match_rules.json"),
+        help="国家匹配配置文件(JSON)，用于维护推广国家与VIP分区代码映射；不存在时使用内置规则",
+    )
+    parser.add_argument(
         "--rebuild-promo-index",
         action="store_true",
         help="强制重建推广报价产品代码-工作表目录",
@@ -466,6 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    _load_country_match_rules(args.country_match_config)
     code = _normalize_code(args.code)
     grade = _normalize_code(args.grade)
 
@@ -507,7 +700,15 @@ def main() -> None:
         _log(f"输出JSON: {output_json}")
         return
 
-    vip_result = query_vip(code, grade, vip_file, args.snapshot_engine, out_dir)
+    vip_result = query_vip(
+        code,
+        grade,
+        vip_file,
+        args.snapshot_engine,
+        out_dir,
+        structured_json=args.vip_structured_json,
+        rebuild_structured_json=args.rebuild_vip_structured_json,
+    )
     modified_result = apply_grade_to_promo(
         code=code,
         grade=grade,

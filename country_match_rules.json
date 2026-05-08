@@ -1,0 +1,16 @@
+{
+  "rules": [
+    {
+      "promo_contains": ["美国"],
+      "vip_tokens": ["US", "US1", "US2"]
+    },
+    {
+      "promo_contains": ["秘鲁-利马区域", "秘鲁利马区域", "利马区域"],
+      "vip_tokens": ["PE1"]
+    },
+    {
+      "promo_contains": ["秘鲁-非利马区域", "秘鲁非利马区域", "非利马区域"],
+      "vip_tokens": ["PE2"]
+    }
+  ]
+}

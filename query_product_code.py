@@ -10,6 +10,7 @@ python query_product_code.py --code CTD
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import re
 import shutil
@@ -327,7 +328,7 @@ def query_promo(
     out_dir: Path,
     index_file: Optional[Path] = None,
     rebuild_index: bool = False,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[ProductLineTable]]:
     promo_total_start = perf_counter()
     init_start = perf_counter()
     _log(f"[推广] 开始读取: {promo_file}")
@@ -362,7 +363,7 @@ def query_promo(
                 "snapshot": 0,
                 "total": total_ms,
             },
-        }
+        }, []
 
     _log(f"[推广] 目录命中工作表: {', '.join(matched_sheets)}")
     extract_start = perf_counter()
@@ -435,7 +436,7 @@ def query_promo(
             "snapshot": snapshot_ms,
             "total": total_ms,
         },
-    }
+    }, matched
 
 
 def query_vip(
@@ -535,18 +536,24 @@ def apply_grade_to_promo(
     snapshot_engine: str,
     out_dir: Path,
     include_sheets: Optional[List[str]] = None,
+    source_tables: Optional[List[ProductLineTable]] = None,
 ) -> Dict[str, Any]:
     apply_total_start = perf_counter()
     _log(f"[覆盖] 开始按等级 {grade} 覆盖推广报价")
-    extract_source_start = perf_counter()
-    source_extractor = PricingExtractor(promo_file)
-    tables = [
-        table_item
-        for table_item in source_extractor.extract(include_sheets=include_sheets)
-        if code in [x.upper() for x in table_item.product_codes]
-    ]
-    extract_source_ms = _ms(extract_source_start)
-    _log(f"[覆盖] 原始表提取耗时: {extract_source_ms}ms")
+    if source_tables is not None:
+        tables = source_tables
+        extract_source_ms = 0
+        _log("[覆盖] 复用推广阶段已提取表，跳过原始表提取")
+    else:
+        extract_source_start = perf_counter()
+        source_extractor = PricingExtractor(promo_file)
+        tables = [
+            table_item
+            for table_item in source_extractor.extract(include_sheets=include_sheets)
+            if code in [x.upper() for x in table_item.product_codes]
+        ]
+        extract_source_ms = _ms(extract_source_start)
+        _log(f"[覆盖] 原始表提取耗时: {extract_source_ms}ms")
 
     match_rows_start = perf_counter()
     update_logs: List[Dict[str, Any]] = []
@@ -636,18 +643,31 @@ def apply_grade_to_promo(
     _log(f"[覆盖] 覆盖写回Excel耗时: {write_excel_ms}ms")
     _log(f"[覆盖] 已写入覆盖结果Excel: {modified_excel}")
 
-    # 用修改后的文件重新提取并截图，保证结构化数据和图片一致
-    reextract_start = perf_counter()
-    modified_extractor = PricingExtractor(modified_excel)
-    modified_tables_all = modified_extractor.extract(include_sheets=include_sheets)
-    modified_tables = [table_item for table_item in modified_tables_all if code in [x.upper() for x in table_item.product_codes]]
-    reextract_ms = _ms(reextract_start)
-    _log(f"[覆盖] 覆盖后表提取耗时: {reextract_ms}ms")
+    # 复用原始提取结果构建覆盖后结构化数据，避免再次扫描整表。
+    log_map: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    for item in update_logs:
+        key = (str(item["sheet"]), str(item["产品线"]), int(item["row"]))
+        log_map[key] = item
+
+    modified_tables: List[ProductLineTable] = deepcopy(tables)
+    for table_item in modified_tables:
+        for row in table_item.rows:
+            row_no = int(row.get("行号", 0))
+            key = (table_item.sheet_name, table_item.product_line, row_no)
+            hit = log_map.get(key)
+            if hit is None:
+                continue
+            row["运费（RMB/KG）"] = hit.get("新运费", "")
+            row["处理费(RMB/票)"] = hit.get("新处理费", "")
+
+    reextract_ms = 0
+    _log("[覆盖] 复用提取结果构建覆盖后结构，跳过覆盖后二次提取")
 
     snapshot_dir = out_dir / "promo_modified_snapshots"
     used_engine = snapshot_engine
     _log(f"[覆盖] 开始生成覆盖后截图（{snapshot_engine}）")
     snapshot_start = perf_counter()
+    modified_extractor = PricingExtractor(modified_excel)
     if snapshot_engine == "com":
         try:
             snap_paths = modified_extractor.save_snapshots_com(modified_tables, snapshot_dir)
@@ -764,7 +784,7 @@ def main() -> None:
     _log(f"[开始] 产品代码={code}, 等级={grade}, 截图引擎={args.snapshot_engine}")
 
     promo_stage_start = perf_counter()
-    promo_result = query_promo(
+    promo_result, promo_tables = query_promo(
         code,
         promo_file,
         args.snapshot_engine,
@@ -818,6 +838,7 @@ def main() -> None:
         snapshot_engine=args.snapshot_engine,
         out_dir=out_dir,
         include_sheets=promo_result.get("matched_sheets"),
+        source_tables=promo_tables,
     )
     apply_ms = _ms(apply_stage_start)
     _log(f"[耗时] 覆盖阶段总耗时: {apply_ms}ms")

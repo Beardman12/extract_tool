@@ -195,6 +195,8 @@ def query_promo(
         if code in codes:
             matched.append(t)
 
+    debug_codes = sorted({c.upper() for t in tables for c in t.product_codes})
+
     snapshot_dir = out_dir / "promo_snapshots"
     snapshots: List[str] = []
     used_engine = snapshot_engine
@@ -215,14 +217,27 @@ def query_promo(
 
     _log(f"[推广] 完成，匹配 {len(matched)}，截图 {len(snapshots)}")
 
+    message = ""
+    if not matched:
+        if matched_sheets:
+            message = (
+                f"产品代码 {code} 已命中工作表({', '.join(matched_sheets)})，"
+                "但未在可识别的报价表块中匹配到该代码。"
+            )
+        else:
+            message = f"产品代码 {code} 在推广报价中匹配不到工作表"
+
     return {
         "input_excel": str(promo_file),
         "index_file": str(promo_index_file),
         "matched_sheets": matched_sheets,
+        "extracted_table_count": len(tables),
+        "extracted_codes": debug_codes,
         "matched_count": len(matched),
         "engine": used_engine,
         "snapshots": snapshots,
         "tables": [_promo_table_to_dict(t) for t in matched],
+        "message": message,
     }
 
 
@@ -479,11 +494,12 @@ def main() -> None:
     )
 
     if promo_result.get("matched_count", 0) <= 0:
+        stop_message = promo_result.get("message") or f"产品代码 {code} 在推广报价中匹配不到工作表，已停止后续执行。"
         payload = {
             "产品代码": code,
             "等级": grade,
             "推广报价": promo_result,
-            "message": f"产品代码 {code} 在推广报价中匹配不到工作表，已停止后续执行。",
+            "message": stop_message,
         }
         output_json = out_dir / f"{code}_query_result.json"
         output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -34,13 +34,21 @@ EXPECTED_HEADERS = [
     "上网参考时效",
     "尺寸限制",
 ]
+REQUIRED_HEADER_PREFIX = [
+    "国家",
+    "重量段/KG",
+    "运费（RMB/KG）",
+    "处理费(RMB/票)",
+]
 
 # 对表头做轻微归一化后匹配，兼容中英文括号/空格差异
 HEADER_ALIASES = {
     "国家": "国家",
+    "包裹国家": "国家",
     "重量段kg": "重量段/KG",
     "重量段/kg": "重量段/KG",
     "重量段": "重量段/KG",
+    "重量": "重量段/KG",
     "运费rmb/kg": "运费（RMB/KG）",
     "运费（rmb/kg）": "运费（RMB/KG）",
     "运费(rmb/kg)": "运费（RMB/KG）",
@@ -49,7 +57,14 @@ HEADER_ALIASES = {
     "处理费（rmb/票）": "处理费(RMB/票)",
     "处理费(rmb/票)": "处理费(RMB/票)",
     "处理费": "处理费(RMB/票)",
+    "税金usd/票": "税金（USD/票）",
+    "税金（usd/票）": "税金（USD/票）",
+    "税金(usd/票)": "税金（USD/票）",
+    "税金": "税金（USD/票）",
     "上网参考时效": "上网参考时效",
+    "参考时效（工作日）": "上网参考时效",
+    "参考时效(工作日)": "上网参考时效",
+    "参考时效": "上网参考时效",
     "尺寸限制": "尺寸限制",
 }
 
@@ -184,20 +199,44 @@ class PricingExtractor:
 
     def _match_header_row(self, ws: Worksheet, row: int, merged_lookup: Dict[Tuple[int, int], Tuple[int, int]]) -> Optional[Tuple[int, List[str]]]:
         max_col = ws.max_column
-        # 6列表头，扫描起始列
-        for start_col in range(1, max_col - 5 + 1):
-            cells = [self._get_value(ws, row, start_col + i, merged_lookup) for i in range(6)]
-            normalized = [self._norm_text(v) for v in cells]
-            mapped: List[str] = []
-            ok = True
-            for item in normalized:
-                if item not in HEADER_ALIASES:
-                    ok = False
-                    break
-                mapped.append(HEADER_ALIASES[item])
+        if max_col < len(REQUIRED_HEADER_PREFIX):
+            return None
 
-            if ok and mapped == EXPECTED_HEADERS:
-                return start_col, mapped
+        for start_col in range(1, max_col - len(REQUIRED_HEADER_PREFIX) + 2):
+            first_headers: List[str] = []
+            prefix_ok = True
+
+            for i in range(len(REQUIRED_HEADER_PREFIX)):
+                raw = self._display_text(self._get_value(ws, row, start_col + i, merged_lookup))
+                if not raw:
+                    prefix_ok = False
+                    break
+                mapped = HEADER_ALIASES.get(self._norm_text(raw))
+                if mapped != REQUIRED_HEADER_PREFIX[i]:
+                    prefix_ok = False
+                    break
+                first_headers.append(mapped)
+
+            if not prefix_ok:
+                continue
+
+            headers = list(first_headers)
+            blank_run = 0
+            col = start_col + len(REQUIRED_HEADER_PREFIX)
+            while col <= max_col:
+                raw = self._display_text(self._get_value(ws, row, col, merged_lookup))
+                if not raw:
+                    blank_run += 1
+                    # 连续两个空列视为表头结束，避免把远处无关列并入。
+                    if blank_run >= 2:
+                        break
+                else:
+                    blank_run = 0
+                    mapped = HEADER_ALIASES.get(self._norm_text(raw), raw)
+                    headers.append(mapped)
+                col += 1
+
+            return start_col, headers
         return None
 
     @staticmethod
@@ -283,7 +322,8 @@ class PricingExtractor:
         if self._match_header_row(ws, check_row, merged_lookup) is not None:
             return 0, ""
 
-        values = [self._get_value(ws, check_row, table.left_col + i, merged_lookup) for i in range(6)]
+        col_count = len(table.headers)
+        values = [self._get_value(ws, check_row, table.left_col + i, merged_lookup) for i in range(col_count)]
         text_values = [self._display_text(v) for v in values if not self._is_blank(v)]
         dedup_text_values: List[str] = []
         seen = set()
@@ -297,8 +337,11 @@ class PricingExtractor:
 
         # 备注行一般是“合并大文本”或“非价格结构行”
         empty_count = sum(1 for v in values if self._is_blank(v))
-        has_weight = self._looks_like_weight(self._display_text(values[1]))
-        has_price = self._looks_like_price(values[2]) and self._looks_like_price(values[3])
+        weight_idx = table.headers.index("重量段/KG") if "重量段/KG" in table.headers else 1
+        freight_idx = table.headers.index("运费（RMB/KG）") if "运费（RMB/KG）" in table.headers else 2
+        handling_idx = table.headers.index("处理费(RMB/票)") if "处理费(RMB/票)" in table.headers else 3
+        has_weight = self._looks_like_weight(self._display_text(values[weight_idx]))
+        has_price = self._looks_like_price(values[freight_idx]) and self._looks_like_price(values[handling_idx])
 
         is_note_shape = empty_count >= 3 and not (has_weight or has_price)
         if is_note_shape or self._looks_like_note_text(row_text):
@@ -339,13 +382,21 @@ class PricingExtractor:
         data_end = header_row
 
         row = data_start
+        col_count = len(headers)
+        idx_country = headers.index("国家")
+        idx_weight = headers.index("重量段/KG")
+        idx_freight = headers.index("运费（RMB/KG）")
+        idx_handling = headers.index("处理费(RMB/票)")
+        idx_eta = headers.index("上网参考时效") if "上网参考时效" in headers else -1
+        idx_size = headers.index("尺寸限制") if "尺寸限制" in headers else -1
+        idx_tax = headers.index("税金（USD/票）") if "税金（USD/票）" in headers else -1
         while row <= ws.max_row:
             # 新表头出现，当前表结束
             maybe_next_header = self._match_header_row(ws, row, merged_lookup)
             if maybe_next_header is not None:
                 break
 
-            values = [self._get_value(ws, row, start_col + i, merged_lookup) for i in range(6)]
+            values = [self._get_value(ws, row, start_col + i, merged_lookup) for i in range(col_count)]
             text_values = [self._display_text(v) for v in values]
 
             if all(self._is_blank(v) for v in values):
@@ -353,7 +404,12 @@ class PricingExtractor:
                 break
 
             empty_count = sum(1 for v in values if self._is_blank(v))
-            country, weight, freight, handling, eta, size_limit = values
+            country = values[idx_country]
+            weight = values[idx_weight]
+            freight = values[idx_freight]
+            handling = values[idx_handling]
+            eta = values[idx_eta] if idx_eta >= 0 else ""
+            size_limit = values[idx_size] if idx_size >= 0 else ""
 
             has_country = not self._is_blank(country)
             has_weight = self._looks_like_weight(self._display_text(weight))
@@ -370,15 +426,21 @@ class PricingExtractor:
 
             # 只保留真正的数据行，防止把服务说明等混入
             if has_weight or (has_country and has_price):
-                row_item = {
-                    "国家": self._display_text(country),
-                    "重量段/KG": self._display_text(weight),
-                    "运费（RMB/KG）": freight,
-                    "处理费(RMB/票)": handling,
-                    "上网参考时效": self._display_text(eta),
-                    "尺寸限制": self._display_text(size_limit),
-                    "行号": row,
-                }
+                row_item = {"行号": row}
+                for i, h in enumerate(headers):
+                    v = values[i]
+                    if h in {"国家", "重量段/KG", "上网参考时效", "尺寸限制"}:
+                        row_item[h] = self._display_text(v)
+                    else:
+                        row_item[h] = v
+
+                # 兼容下游逻辑：固定字段缺失时补空值。
+                row_item.setdefault("国家", self._display_text(country))
+                row_item.setdefault("重量段/KG", self._display_text(weight))
+                row_item.setdefault("运费（RMB/KG）", freight)
+                row_item.setdefault("处理费(RMB/票)", handling)
+                row_item.setdefault("上网参考时效", self._display_text(eta))
+                row_item.setdefault("尺寸限制", self._display_text(size_limit))
                 rows.append(row_item)
                 data_end = row
             else:
@@ -392,7 +454,7 @@ class PricingExtractor:
             data_end = header_row
 
         left_col = start_col
-        right_col = start_col + 5
+        right_col = start_col + col_count - 1
         top_row = max(1, header_row - 2)
         bottom_row = data_end
 

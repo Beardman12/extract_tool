@@ -157,14 +157,13 @@ async def request_log_middleware(request, call_next):
 def get_promo_options(
     promo_input: Optional[str] = Query(default=None),
     rebuild_index: bool = Query(default=False),
-    include_content: bool = Query(default=True),
 ):
     logger = get_logger()
     promo_file = _resolve_promo_file(promo_input)
     if not promo_file.exists():
         raise HTTPException(status_code=404, detail=f"推广报价文件不存在: {promo_file}")
 
-    logger.info("读取推广选项，文件=%s rebuild_index=%s include_content=%s", promo_file, rebuild_index, include_content)
+    logger.info("读取推广选项，文件=%s rebuild_index=%s（仅目录索引）", promo_file, rebuild_index)
 
     extractor = PricingExtractor(promo_file)
     index_file = extractor.default_index_file()
@@ -177,31 +176,12 @@ def get_promo_options(
 
     code_to_sheets: Dict[str, List[str]] = index_data.get("code_to_sheets", {})
 
-    content_map: Dict[str, List[Dict[str, Any]]] = {}
-    if include_content:
-        tables = extractor.extract()
-        for t in tables:
-            item = {
-                "sheet": t.sheet_name,
-                "product_line": t.product_line,
-                "update_time": t.update_time,
-                "header_row": t.header_row,
-                "row_count": len(t.rows),
-                "headers": t.headers,
-            }
-            for c in t.product_codes:
-                key = str(c).strip().upper()
-                if not key:
-                    continue
-                content_map.setdefault(key, []).append(item)
-
     options: List[Dict[str, Any]] = []
     for code in sorted(code_to_sheets.keys()):
         options.append(
             {
                 "code": code,
                 "sheets": code_to_sheets.get(code, []),
-                "content": content_map.get(code, []),
             }
         )
 

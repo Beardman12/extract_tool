@@ -341,6 +341,18 @@ def query_promo(
     _log("[推广] 提取器初始化完成，开始目录匹配...")
     promo_index_file = index_file or extractor.default_index_file()
     matched_sheets = extractor.get_sheets_by_code(code=code, index_file=promo_index_file, rebuild=rebuild_index)
+    anchor_rows_by_sheet = extractor.get_sheet_anchor_rows_by_code(
+        code=code,
+        index_file=promo_index_file,
+        rebuild=rebuild_index,
+    )
+    if matched_sheets and not anchor_rows_by_sheet and not rebuild_index:
+        _log("[推广] 当前索引缺少代码锚点行，自动升级重建索引...")
+        anchor_rows_by_sheet = extractor.get_sheet_anchor_rows_by_code(
+            code=code,
+            index_file=promo_index_file,
+            rebuild=True,
+        )
     index_ms = _ms(index_start)
     _log(f"[推广] 目录匹配耗时: {index_ms}ms")
 
@@ -367,7 +379,7 @@ def query_promo(
 
     _log(f"[推广] 目录命中工作表: {', '.join(matched_sheets)}")
     extract_start = perf_counter()
-    tables = extractor.extract(include_sheets=matched_sheets)
+    tables = extractor.extract(include_sheets=matched_sheets, anchor_rows_by_sheet=anchor_rows_by_sheet)
     extract_ms = _ms(extract_start)
     _log(f"[推广] 工作表提取耗时: {extract_ms}ms")
 

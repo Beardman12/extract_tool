@@ -142,6 +142,7 @@ class PricingExtractor:
 
     def build_code_sheet_index(self) -> Dict[str, Any]:
         code_to_sheets: Dict[str, set] = {}
+        code_to_sheet_rows: Dict[str, Dict[str, set]] = {}
 
         idx_wb = load_workbook(self.excel_path, data_only=True, read_only=True)
         try:
@@ -151,7 +152,7 @@ class PricingExtractor:
                     print(f"[索引] 跳过工作表: {ws.title}", flush=True)
                     continue
                 print(f"[索引] 扫描工作表: {ws.title}", flush=True)
-                for row in ws.iter_rows(values_only=True):
+                for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
                     for value in row:
                         if value is None:
                             continue
@@ -166,14 +167,23 @@ class PricingExtractor:
                         codes = self._extract_product_codes(text.upper())
                         for code in codes:
                             code_to_sheets.setdefault(code, set()).add(ws.title)
+                            code_to_sheet_rows.setdefault(code, {}).setdefault(ws.title, set()).add(r_idx)
         finally:
             idx_wb.close()
 
         normalized = {k: sorted(list(v)) for k, v in sorted(code_to_sheets.items())}
+        normalized_rows = {
+            code: {
+                sheet: sorted(list(rows))
+                for sheet, rows in sorted(sheet_rows.items())
+            }
+            for code, sheet_rows in sorted(code_to_sheet_rows.items())
+        }
         return {
             "excel": str(self.excel_path),
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "code_to_sheets": normalized,
+            "code_to_sheet_rows": normalized_rows,
         }
 
     @staticmethod
@@ -199,6 +209,37 @@ class PricingExtractor:
         mapping = data.get("code_to_sheets", {})
         sheets = mapping.get(code_upper, [])
         return sorted({s for s in sheets})
+
+    def get_sheet_anchor_rows_by_code(self, code: str, index_file: Path, rebuild: bool = False) -> Dict[str, List[int]]:
+        if rebuild or not index_file.exists():
+            print(f"[索引] 开始构建目录文件: {index_file}", flush=True)
+            data = self.build_code_sheet_index()
+            self.save_code_sheet_index(index_file, data)
+            print(f"[索引] 目录构建完成: {index_file}", flush=True)
+        else:
+            data = self.load_code_sheet_index(index_file)
+
+        code_upper = code.strip().upper()
+        mapping = data.get("code_to_sheet_rows", {})
+        row_map = mapping.get(code_upper, {})
+        if not isinstance(row_map, dict):
+            return {}
+
+        out: Dict[str, List[int]] = {}
+        for sheet, rows in row_map.items():
+            if not isinstance(rows, list):
+                continue
+            cleaned: List[int] = []
+            for r in rows:
+                try:
+                    rv = int(r)
+                except (TypeError, ValueError):
+                    continue
+                if rv > 0:
+                    cleaned.append(rv)
+            if cleaned:
+                out[sheet] = sorted(set(cleaned))
+        return out
 
     def _match_header_row(self, ws: Worksheet, row: int, merged_lookup: Dict[Tuple[int, int], Tuple[int, int]]) -> Optional[Tuple[int, List[str]]]:
         max_col = ws.max_column
@@ -639,7 +680,12 @@ class PricingExtractor:
     def save_snapshots_com(self, tables: List[ProductLineTable], output_dir: Path) -> List[Path]:
         return self._save_snapshots_via_excel_com(tables, output_dir)
 
-    def extract(self, include_sheets: Optional[List[str]] = None) -> List[ProductLineTable]:
+    def extract(
+        self,
+        include_sheets: Optional[List[str]] = None,
+        anchor_rows_by_sheet: Optional[Dict[str, List[int]]] = None,
+        anchor_window_rows: int = 60,
+    ) -> List[ProductLineTable]:
         all_tables: List[ProductLineTable] = []
         target_sheets = include_sheets or self.workbook.sheetnames
         unknown = [s for s in target_sheets if s not in self.workbook.sheetnames]
@@ -649,21 +695,50 @@ class PricingExtractor:
         for sheet_name in target_sheets:
             ws = self.workbook[sheet_name]
             merged_lookup = self._build_merged_lookup(ws)
-            row = 1
-            while row <= ws.max_row:
-                header_info = self._match_header_row(ws, row, merged_lookup)
-                if header_info is None:
-                    row += 1
-                    continue
+            hinted_rows = (anchor_rows_by_sheet or {}).get(sheet_name, [])
 
-                start_col, headers = header_info
-                table = self._extract_one_table(ws, row, start_col, headers, merged_lookup)
+            if hinted_rows:
+                row_candidates: List[int] = []
+                seen_rows = set()
+                for anchor in hinted_rows:
+                    start_row = max(1, int(anchor))
+                    end_row = min(ws.max_row, int(anchor) + anchor_window_rows)
+                    for r in range(start_row, end_row + 1):
+                        if r not in seen_rows:
+                            seen_rows.add(r)
+                            row_candidates.append(r)
+                row_candidates.sort()
 
-                if table.rows:
-                    all_tables.append(table)
-                    row = max(table.data_end_row + 1, row + 1)
-                else:
-                    row += 1
+                skip_until = 0
+                for row in row_candidates:
+                    if row <= skip_until:
+                        continue
+
+                    header_info = self._match_header_row(ws, row, merged_lookup)
+                    if header_info is None:
+                        continue
+
+                    start_col, headers = header_info
+                    table = self._extract_one_table(ws, row, start_col, headers, merged_lookup)
+                    if table.rows:
+                        all_tables.append(table)
+                        skip_until = table.data_end_row
+            else:
+                row = 1
+                while row <= ws.max_row:
+                    header_info = self._match_header_row(ws, row, merged_lookup)
+                    if header_info is None:
+                        row += 1
+                        continue
+
+                    start_col, headers = header_info
+                    table = self._extract_one_table(ws, row, start_col, headers, merged_lookup)
+
+                    if table.rows:
+                        all_tables.append(table)
+                        row = max(table.data_end_row + 1, row + 1)
+                    else:
+                        row += 1
 
         return all_tables
 
@@ -808,6 +883,7 @@ def main() -> None:
 
     extractor = PricingExtractor(args.input)
     include_sheets: Optional[List[str]] = None
+    anchor_rows_by_sheet: Optional[Dict[str, List[int]]] = None
 
     if args.code.strip():
         index_file = args.index_file or extractor.default_index_file()
@@ -823,12 +899,17 @@ def main() -> None:
             return
 
         include_sheets = matched_sheets
+        anchor_rows_by_sheet = extractor.get_sheet_anchor_rows_by_code(
+            code=args.code,
+            index_file=index_file,
+            rebuild=False,
+        )
         print(f"产品代码 {args.code.strip().upper()} 匹配工作表: {', '.join(include_sheets)}")
         print(f"目录文件: {index_file}")
     elif args.sheets.strip():
         include_sheets = [x.strip() for x in args.sheets.split(",") if x.strip()]
 
-    tables = extractor.extract(include_sheets=include_sheets)
+    tables = extractor.extract(include_sheets=include_sheets, anchor_rows_by_sheet=anchor_rows_by_sheet)
 
     write_outputs(tables, args.output_json, args.output_xlsx)
     if args.snapshot_engine == "com":

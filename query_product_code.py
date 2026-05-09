@@ -20,6 +20,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 from extract_pricing_details import PricingExtractor, ProductLineTable
 from grade_quote_extractor import GradeQuoteExtractor, ProductCodeBlock
@@ -117,6 +118,37 @@ def _is_empty_value(v: Any) -> bool:
 
 def _is_follow_public(v: Any) -> bool:
     return "随公开价" in str(v)
+
+
+def _build_merged_anchor_lookup(ws: Worksheet) -> Dict[Tuple[int, int], Tuple[int, int]]:
+    lookup: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    for merged_range in ws.merged_cells.ranges:
+        min_col, min_row, max_col, max_row = (
+            merged_range.min_col,
+            merged_range.min_row,
+            merged_range.max_col,
+            merged_range.max_row,
+        )
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                lookup[(row, col)] = (min_row, min_col)
+    return lookup
+
+
+def _set_cell_value_safely(
+    ws: Worksheet,
+    row: int,
+    col: int,
+    value: Any,
+    merged_lookup: Dict[Tuple[int, int], Tuple[int, int]],
+) -> bool:
+    anchor = merged_lookup.get((row, col))
+    if anchor is not None:
+        ws.cell(row=anchor[0], column=anchor[1]).value = value
+        return (anchor[0], anchor[1]) != (row, col)
+
+    ws.cell(row=row, column=col).value = value
+    return False
 
 
 def _split_country_zone(zone: str) -> List[str]:
@@ -632,10 +664,16 @@ def apply_grade_to_promo(
     modified_excel = out_dir / f"{code}_promo_modified_by_{grade}.xlsx"
     shutil.copy2(promo_file, modified_excel)
     wb = load_workbook(modified_excel)
+    merged_lookup_by_sheet: Dict[str, Dict[Tuple[int, int], Tuple[int, int]]] = {}
+    merged_redirect_count = 0
 
     for log in update_logs:
         ws = wb[log["sheet"]]
         row_no = int(log["row"])
+        merged_lookup = merged_lookup_by_sheet.get(ws.title)
+        if merged_lookup is None:
+            merged_lookup = _build_merged_anchor_lookup(ws)
+            merged_lookup_by_sheet[ws.title] = merged_lookup
 
         target_table = None
         for table_item in tables:
@@ -648,11 +686,15 @@ def apply_grade_to_promo(
         freight_col = target_table.left_col + 2
         handling_col = target_table.left_col + 3
 
-        ws.cell(row=row_no, column=freight_col).value = log["新运费"]
-        ws.cell(row=row_no, column=handling_col).value = log["新处理费"]
+        if _set_cell_value_safely(ws, row_no, freight_col, log["新运费"], merged_lookup):
+            merged_redirect_count += 1
+        if _set_cell_value_safely(ws, row_no, handling_col, log["新处理费"], merged_lookup):
+            merged_redirect_count += 1
 
     wb.save(modified_excel)
     write_excel_ms = _ms(write_excel_start)
+    if merged_redirect_count > 0:
+        _log(f"[覆盖] 合并单元格写入重定向次数: {merged_redirect_count}")
     _log(f"[覆盖] 覆盖写回Excel耗时: {write_excel_ms}ms")
     _log(f"[覆盖] 已写入覆盖结果Excel: {modified_excel}")
 

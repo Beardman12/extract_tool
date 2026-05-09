@@ -15,6 +15,14 @@
     {
       "promo_contains": ["哥伦比亚"],
       "vip_tokens": ["CO"]
+    },
+    {
+      "promo_contains": ["奥地利"],
+      "vip_tokens": ["AT"]
+    },
+    {
+      "promo_contains": ["波兰"],
+      "vip_tokens": ["PL"]
     }
   ]
 }

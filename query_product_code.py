@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import json
+import math
 import re
 import shutil
 import traceback
+import unicodedata
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
@@ -149,6 +151,80 @@ def _set_cell_value_safely(
 
     ws.cell(row=row, column=col).value = value
     return False
+
+
+def _estimate_display_len(text: str) -> int:
+    total = 0
+    for ch in text:
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return max(1, total)
+
+
+def _estimate_row_height(
+    ws: Worksheet,
+    row: int,
+    left_col: int,
+    right_col: int,
+    merged_lookup: Dict[Tuple[int, int], Tuple[int, int]],
+    merged_anchor_col_span: Dict[Tuple[int, int], int],
+) -> float:
+    max_lines = 1
+
+    for col in range(left_col, right_col + 1):
+        anchor = merged_lookup.get((row, col))
+        target_row, target_col = anchor if anchor is not None else (row, col)
+        # 合并单元格只在锚点行/列计算一次，避免重复放大。
+        if (target_row, target_col) != (row, col):
+            continue
+
+        value = ws.cell(row=target_row, column=target_col).value
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+
+        col_span = max(1, merged_anchor_col_span.get((target_row, target_col), 1))
+        text_width = 0.0
+        for c in range(target_col, min(right_col, target_col + col_span - 1) + 1):
+            width = ws.column_dimensions[ws.cell(row=1, column=c).column_letter].width
+            text_width += float(width if width is not None else 12)
+
+        # 经验系数：Excel列宽约可容纳 ~1.2 倍字符数（中英文混排做宽字符加权）。
+        chars_per_line = max(1, int(text_width * 1.2))
+        wrapped_lines = 0
+        for line in text.splitlines() or [text]:
+            wrapped_lines += max(1, math.ceil(_estimate_display_len(line) / chars_per_line))
+
+        max_lines = max(max_lines, wrapped_lines)
+
+    # 近似Excel默认行高与行间距；限制上限防止异常文本把行高拉太大。
+    return min(220.0, 15.0 + max(0, max_lines - 1) * 15.0)
+
+
+def _autofit_table_rows(ws: Worksheet, table: ProductLineTable, merged_lookup: Dict[Tuple[int, int], Tuple[int, int]]) -> int:
+    merged_anchor_col_span: Dict[Tuple[int, int], int] = {}
+    for merged_range in ws.merged_cells.ranges:
+        merged_anchor_col_span[(merged_range.min_row, merged_range.min_col)] = max(
+            merged_anchor_col_span.get((merged_range.min_row, merged_range.min_col), 1),
+            merged_range.max_col - merged_range.min_col + 1,
+        )
+
+    changed = 0
+    for row in range(table.top_row, table.bottom_row + 1):
+        required_height = _estimate_row_height(
+            ws=ws,
+            row=row,
+            left_col=table.left_col,
+            right_col=table.right_col,
+            merged_lookup=merged_lookup,
+            merged_anchor_col_span=merged_anchor_col_span,
+        )
+        current_height = ws.row_dimensions[row].height
+        if current_height is None or required_height > float(current_height):
+            ws.row_dimensions[row].height = required_height
+            changed += 1
+    return changed
 
 
 def _split_country_zone(zone: str) -> List[str]:
@@ -607,6 +683,7 @@ def apply_grade_to_promo(
             row_no = int(row.get("行号", 0))
             promo_country = str(row.get("国家", ""))
             promo_weight = str(row.get("重量段/KG", ""))
+            is_data_row = _parse_weight_range(promo_weight) is not None
 
             rec = _pick_best_vip_record(promo_country, promo_weight, vip_records)
             current_f = row.get("运费（RMB/KG）")
@@ -617,6 +694,27 @@ def apply_grade_to_promo(
             status = "unmatched_blank"
             matched_zone = ""
             matched_vip_weight = ""
+
+            if not is_data_row:
+                status = "skip_non_data_row"
+                update_logs.append(
+                    {
+                        "sheet": table.sheet_name,
+                        "产品线": table.product_line,
+                        "row": row_no,
+                        "国家": promo_country,
+                        "重量段KG": promo_weight,
+                        "原运费": current_f,
+                        "原处理费": current_h,
+                        "新运费": current_f,
+                        "新处理费": current_h,
+                        "匹配状态": status,
+                        "匹配国家分区": matched_zone,
+                        "匹配VIP重量段KG": matched_vip_weight,
+                        "should_write": False,
+                    }
+                )
+                continue
 
             if rec is not None:
                 fee_f, fee_h = _select_grade_fee(rec, grade)
@@ -654,6 +752,7 @@ def apply_grade_to_promo(
                     "匹配状态": status,
                     "匹配国家分区": matched_zone,
                     "匹配VIP重量段KG": matched_vip_weight,
+                    "should_write": True,
                 }
             )
     match_rows_ms = _ms(match_rows_start)
@@ -666,8 +765,12 @@ def apply_grade_to_promo(
     wb = load_workbook(modified_excel)
     merged_lookup_by_sheet: Dict[str, Dict[Tuple[int, int], Tuple[int, int]]] = {}
     merged_redirect_count = 0
+    touched_table_keys: set[Tuple[str, str]] = set()
 
     for log in update_logs:
+        if not bool(log.get("should_write", True)):
+            continue
+
         ws = wb[log["sheet"]]
         row_no = int(log["row"])
         merged_lookup = merged_lookup_by_sheet.get(ws.title)
@@ -682,6 +785,7 @@ def apply_grade_to_promo(
                 break
         if target_table is None:
             continue
+        touched_table_keys.add((target_table.sheet_name, target_table.product_line))
 
         freight_col = target_table.left_col + 2
         handling_col = target_table.left_col + 3
@@ -691,8 +795,25 @@ def apply_grade_to_promo(
         if _set_cell_value_safely(ws, row_no, handling_col, log["新处理费"], merged_lookup):
             merged_redirect_count += 1
 
+    autofit_changed_rows = 0
+    table_map: Dict[Tuple[str, str], ProductLineTable] = {
+        (t.sheet_name, t.product_line): t for t in tables
+    }
+    for key in touched_table_keys:
+        table_item = table_map.get(key)
+        if table_item is None:
+            continue
+        ws = wb[table_item.sheet_name]
+        merged_lookup = merged_lookup_by_sheet.get(ws.title)
+        if merged_lookup is None:
+            merged_lookup = _build_merged_anchor_lookup(ws)
+            merged_lookup_by_sheet[ws.title] = merged_lookup
+        autofit_changed_rows += _autofit_table_rows(ws, table_item, merged_lookup)
+
     wb.save(modified_excel)
     write_excel_ms = _ms(write_excel_start)
+    if autofit_changed_rows > 0:
+        _log(f"[覆盖] 行高自适应调整行数: {autofit_changed_rows}")
     if merged_redirect_count > 0:
         _log(f"[覆盖] 合并单元格写入重定向次数: {merged_redirect_count}")
     _log(f"[覆盖] 覆盖写回Excel耗时: {write_excel_ms}ms")

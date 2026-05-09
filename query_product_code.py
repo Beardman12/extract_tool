@@ -405,8 +405,9 @@ def query_promo(
         if snapshot_engine == "com":
             try:
                 paths = extractor.save_snapshots_com(matched, snapshot_dir)
-            except Exception:
-                _log("[推广] COM截图失败，自动回退 draw")
+            except Exception as exc:
+                _log(f"[推广] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
+                _log(f"[推广] COM截图堆栈:\n{traceback.format_exc()}")
                 used_engine = "draw"
                 paths = extractor.save_snapshots(matched, snapshot_dir)
         else:
@@ -683,8 +684,9 @@ def apply_grade_to_promo(
     if snapshot_engine == "com":
         try:
             snap_paths = modified_extractor.save_snapshots_com(modified_tables, snapshot_dir)
-        except Exception:
-            _log("[覆盖] COM截图失败，自动回退 draw")
+        except Exception as exc:
+            _log(f"[覆盖] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
+            _log(f"[覆盖] COM截图堆栈:\n{traceback.format_exc()}")
             used_engine = "draw"
             snap_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
     else:

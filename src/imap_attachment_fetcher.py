@@ -17,7 +17,7 @@ DEFAULT_IMAP_PORT = 993
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
-OUTPUT_ROOT = BASE_DIR / "output" / "mail_attachments"
+OUTPUT_ROOT = BASE_DIR / "output" / "mail_attachments" / "direct_price_adjustment"
 STATE_PATH = BASE_DIR / "output" / "mail_fetch_state.json"
 
 

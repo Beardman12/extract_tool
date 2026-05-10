@@ -27,6 +27,7 @@ WORKSPACE = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = WORKSPACE / "output"
 CACHE_DIR = OUTPUT_DIR / "cache"
 LOG_DIR = WORKSPACE / "logs"
+ATTACHMENT_ROOT = OUTPUT_DIR / "mail_attachments" / "direct_price_adjustment"
 
 
 _logger: Optional[logging.Logger] = None
@@ -67,6 +68,39 @@ def _find_first_xlsx(workspace: Path, keyword: str) -> Optional[Path]:
     return None
 
 
+def _find_latest_xlsx_in_dir(folder: Path, keyword: str) -> Optional[Path]:
+    candidates = []
+    for p in folder.glob("*.xlsx"):
+        if p.name.startswith("~$"):
+            continue
+        if keyword in p.name:
+            candidates.append(p)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _iter_batch_dirs_desc(root: Path) -> List[Path]:
+    if not root.exists():
+        return []
+    dirs = [p for p in root.iterdir() if p.is_dir()]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return dirs
+
+
+def _resolve_latest_pair_from_attachments(root: Path) -> tuple[Path, Path]:
+    if not root.exists():
+        raise HTTPException(status_code=404, detail=f"抓取目录不存在: {root}")
+
+    for batch_dir in _iter_batch_dirs_desc(root):
+        promo = _find_latest_xlsx_in_dir(batch_dir, "出口易物流推广报价表")
+        vip = _find_latest_xlsx_in_dir(batch_dir, "2025年直发产品定价+vip")
+        if promo is not None and vip is not None:
+            return promo, vip
+
+    raise HTTPException(status_code=404, detail="抓取目录中未找到同一批次的推广+VIP报价Excel")
+
+
 def _resolve_promo_file(promo_input: Optional[str]) -> Path:
     if promo_input:
         p = Path(promo_input)
@@ -74,10 +108,8 @@ def _resolve_promo_file(promo_input: Optional[str]) -> Path:
             return p
         return (WORKSPACE / p).resolve()
 
-    found = _find_first_xlsx(WORKSPACE, "出口易物流推广报价表")
-    if found is None:
-        raise HTTPException(status_code=404, detail="未找到推广报价Excel，请通过 promo_input 指定")
-    return found
+    promo, _ = _resolve_latest_pair_from_attachments(ATTACHMENT_ROOT)
+    return promo
 
 
 def _resolve_vip_file(vip_input: Optional[str]) -> Path:
@@ -87,10 +119,8 @@ def _resolve_vip_file(vip_input: Optional[str]) -> Path:
             return p
         return (WORKSPACE / p).resolve()
 
-    found = _find_first_xlsx(WORKSPACE, "2025年直发产品定价+vip")
-    if found is None:
-        raise HTTPException(status_code=404, detail="未找到VIP等级报价Excel，请通过 vip_input 指定")
-    return found
+    _, vip = _resolve_latest_pair_from_attachments(ATTACHMENT_ROOT)
+    return vip
 
 
 def _default_vip_structured_json(vip_file: Path) -> Path:

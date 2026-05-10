@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from datetime import datetime
 import json
 import math
 import re
@@ -44,6 +45,78 @@ def _find_first_xlsx(workspace: Path, keyword: str) -> Optional[Path]:
         if keyword in p.name:
             return p
     return None
+
+
+def _is_excel_candidate(p: Path) -> bool:
+    return p.is_file() and p.suffix.lower() == ".xlsx" and not p.name.startswith("~$")
+
+
+def _find_latest_xlsx_in_dir(folder: Path, keyword: str) -> Optional[Path]:
+    candidates = [
+        p for p in folder.glob("*.xlsx") if _is_excel_candidate(p) and keyword in p.name
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _iter_batch_dirs_desc(root: Path) -> List[Path]:
+    if not root.exists():
+        return []
+    dirs = [p for p in root.iterdir() if p.is_dir()]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return dirs
+
+
+def _find_latest_xlsx_in_batches(root: Path, keyword: str) -> Optional[Path]:
+    candidates: List[Path] = []
+    for batch_dir in _iter_batch_dirs_desc(root):
+        found = _find_latest_xlsx_in_dir(batch_dir, keyword)
+        if found is not None:
+            candidates.append(found)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_latest_pair_from_attachments(
+    attachment_root: Path,
+    latest_strategy: str,
+) -> Tuple[Path, Path, Optional[Path]]:
+    promo_keyword = "推广报价表"
+    vip_keyword = "直发产品定价"
+
+    if not attachment_root.exists():
+        raise FileNotFoundError(f"抓取目录不存在: {attachment_root}")
+
+    if latest_strategy == "batch":
+        for batch_dir in _iter_batch_dirs_desc(attachment_root):
+            promo = _find_latest_xlsx_in_dir(batch_dir, promo_keyword)
+            vip = _find_latest_xlsx_in_dir(batch_dir, vip_keyword)
+            if promo is not None and vip is not None:
+                return promo, vip, batch_dir
+        raise FileNotFoundError(
+            "抓取目录中未找到同一批次同时包含推广和VIP报价的Excel文件"
+        )
+
+    promo = _find_latest_xlsx_in_batches(attachment_root, promo_keyword)
+    vip = _find_latest_xlsx_in_batches(attachment_root, vip_keyword)
+    if promo is None:
+        raise FileNotFoundError("抓取目录中未找到推广报价Excel")
+    if vip is None:
+        raise FileNotFoundError("抓取目录中未找到VIP等级报价Excel")
+    return promo, vip, None
+
+
+def _to_abs_path(p: Path, base_dir: Path) -> Path:
+    if p.is_absolute():
+        return p
+    return (base_dir / p).resolve()
+
+
+def _safe_tag(text: str) -> str:
+    s = re.sub(r"[^0-9A-Za-z_.-]+", "_", text).strip("_")
+    return s or "run"
 
 
 def _normalize_code(code: str) -> str:
@@ -888,13 +961,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--promo-input",
         type=Path,
         default=None,
-        help="推广报价Excel路径（默认自动识别：出口易物流推广报价表）",
+        help="推广报价Excel路径（可选；为空时自动从抓取目录选择最新文件）",
     )
     parser.add_argument(
         "--vip-input",
         type=Path,
         default=None,
-        help="VIP等级报价Excel路径（默认自动识别：2025年直发产品定价+vip）",
+        help="VIP等级报价Excel路径（可选；为空时自动从抓取目录选择最新文件）",
+    )
+    parser.add_argument(
+        "--attachment-root",
+        type=Path,
+        default=Path("output") / "mail_attachments" / "direct_price_adjustment",
+        help="抓取附件根目录，默认 output/mail_attachments/direct_price_adjustment",
+    )
+    parser.add_argument(
+        "--latest-strategy",
+        choices=["batch", "file"],
+        default="batch",
+        help="最新文件选择策略：batch=同批次成对文件优先；file=分别取全局最新",
     )
     parser.add_argument(
         "--snapshot-engine",
@@ -948,18 +1033,40 @@ def main() -> None:
 
     workspace = Path.cwd()
 
-    promo_file = args.promo_input or _find_first_xlsx(workspace, "出口易物流推广报价表")
-    vip_file = args.vip_input or _find_first_xlsx(workspace, "2025年直发产品定价+vip")
+    promo_file = _to_abs_path(args.promo_input, workspace) if args.promo_input else None
+    vip_file = _to_abs_path(args.vip_input, workspace) if args.vip_input else None
+    batch_dir: Optional[Path] = None
+
+    if promo_file is None or vip_file is None:
+        attachment_root = _to_abs_path(args.attachment_root, workspace)
+        auto_promo, auto_vip, auto_batch_dir = _resolve_latest_pair_from_attachments(
+            attachment_root=attachment_root,
+            latest_strategy=args.latest_strategy,
+        )
+        if promo_file is None:
+            promo_file = auto_promo
+        if vip_file is None:
+            vip_file = auto_vip
+        batch_dir = auto_batch_dir
 
     if promo_file is None:
-        raise FileNotFoundError("未找到推广报价Excel，请使用 --promo-input 指定")
+        raise FileNotFoundError("未找到推广报价Excel，请通过 --promo-input 指定或检查抓取目录")
     if vip_file is None:
-        raise FileNotFoundError("未找到VIP等级报价Excel，请使用 --vip-input 指定")
+        raise FileNotFoundError("未找到VIP等级报价Excel，请通过 --vip-input 指定或检查抓取目录")
+    if not promo_file.exists():
+        raise FileNotFoundError(f"推广报价Excel不存在: {promo_file}")
+    if not vip_file.exists():
+        raise FileNotFoundError(f"VIP等级报价Excel不存在: {vip_file}")
 
-    out_dir = args.output_dir / code
+    source_tag = batch_dir.name if batch_dir is not None else f"manual_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    source_tag = _safe_tag(source_tag)
+    out_dir = args.output_dir / code / source_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _log(f"[开始] 产品代码={code}, 等级={grade}, 截图引擎={args.snapshot_engine}")
+    _log(f"[输入] 推广文件: {promo_file}")
+    _log(f"[输入] VIP文件: {vip_file}")
+    _log(f"[输入] 来源标识: {source_tag}")
 
     promo_stage_start = perf_counter()
     promo_result, promo_tables = query_promo(
@@ -978,6 +1085,12 @@ def main() -> None:
         payload = {
             "产品代码": code,
             "等级": grade,
+            "输入来源": {
+                "promo_file": str(promo_file),
+                "vip_file": str(vip_file),
+                "batch_dir": str(batch_dir) if batch_dir is not None else "",
+                "source_tag": source_tag,
+            },
             "推广报价": promo_result,
             "message": stop_message,
             "timing_ms": {
@@ -989,8 +1102,12 @@ def main() -> None:
         }
         output_json = out_dir / f"{code}_query_result.json"
         output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        latest_json = args.output_dir / code / f"{code}_query_result.json"
+        latest_json.parent.mkdir(parents=True, exist_ok=True)
+        latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         _log(payload["message"])
         _log(f"输出JSON: {output_json}")
+        _log(f"输出JSON(兼容路径): {latest_json}")
         _log(f"[耗时] 总耗时: {_ms(main_total_start)}ms")
         return
 
@@ -1026,6 +1143,12 @@ def main() -> None:
     payload = {
         "产品代码": code,
         "等级": grade,
+        "输入来源": {
+            "promo_file": str(promo_file),
+            "vip_file": str(vip_file),
+            "batch_dir": str(batch_dir) if batch_dir is not None else "",
+            "source_tag": source_tag,
+        },
         "推广报价": promo_result,
         "VIP等级报价": vip_result,
         "推广报价_按等级覆盖后": modified_result,
@@ -1039,6 +1162,9 @@ def main() -> None:
 
     output_json = out_dir / f"{code}_query_result.json"
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    latest_json = args.output_dir / code / f"{code}_query_result.json"
+    latest_json.parent.mkdir(parents=True, exist_ok=True)
+    latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"产品代码: {code}")
     print(f"等级: {grade}")
@@ -1050,6 +1176,7 @@ def main() -> None:
     print(f"覆盖后推广表匹配: {modified_result['matched_table_count']}")
     print(f"耗时(推广/VIP/覆盖/总计, ms): {promo_ms}/{vip_ms}/{apply_ms}/{total_ms}")
     print(f"输出JSON: {output_json}")
+    print(f"输出JSON(兼容路径): {latest_json}")
     print(f"推广截图目录: {out_dir / 'promo_snapshots'}")
     print(f"VIP截图目录: {out_dir / 'vip_snapshots'}")
     print(f"覆盖后推广截图目录: {out_dir / 'promo_modified_snapshots'}")

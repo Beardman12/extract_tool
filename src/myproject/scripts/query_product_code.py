@@ -119,6 +119,34 @@ def _safe_tag(text: str) -> str:
     return s or "run"
 
 
+def _infer_source_tag_from_file(file_path: Path, attachment_root: Path) -> Optional[str]:
+    try:
+        rel = file_path.resolve().relative_to(attachment_root.resolve())
+    except Exception:
+        return None
+    parts = rel.parts
+    if len(parts) < 2:
+        return None
+    return _safe_tag(parts[0])
+
+
+def _result_json_filename(code: str, grade: str) -> str:
+    return f"{code}_{grade}_query_result.json"
+
+
+def _vip_has_grade_data(records: List[Dict[str, Any]], grade: str) -> bool:
+    key = f"{grade}等级"
+    for rec in records:
+        data = rec.get(key)
+        if not isinstance(data, dict):
+            continue
+        fee_f = data.get("运费")
+        fee_h = data.get("处理费")
+        if not _is_empty_value(fee_f) or not _is_empty_value(fee_h):
+            return True
+    return False
+
+
 def _normalize_code(code: str) -> str:
     return code.strip().upper()
 
@@ -990,6 +1018,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="最新文件选择策略：batch=同批次成对文件优先；file=分别取全局最新",
     )
     parser.add_argument(
+        "--source-tag",
+        type=str,
+        default=None,
+        help="可选：显式指定本次输出与缓存批次标识（用于预生成任务）",
+    )
+    parser.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help="强制重建，不使用已预生成的同 code+grade 结果",
+    )
+    parser.add_argument(
         "--snapshot-engine",
         choices=["com", "draw"],
         default="com",
@@ -1066,10 +1105,26 @@ def main() -> None:
     if not vip_file.exists():
         raise FileNotFoundError(f"VIP等级报价Excel不存在: {vip_file}")
 
-    source_tag = batch_dir.name if batch_dir is not None else f"manual_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    source_tag = _safe_tag(source_tag)
-    out_dir = args.output_dir / code / source_tag
+    attachment_root = _to_abs_path(args.attachment_root, workspace)
+    inferred_tag = _infer_source_tag_from_file(promo_file, attachment_root) or _infer_source_tag_from_file(vip_file, attachment_root)
+    if args.source_tag:
+        source_tag = _safe_tag(args.source_tag)
+    elif batch_dir is not None:
+        source_tag = _safe_tag(batch_dir.name)
+    elif inferred_tag:
+        source_tag = inferred_tag
+    else:
+        source_tag = _safe_tag(f"manual_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+
+    out_dir = args.output_dir / source_tag / code
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_json = out_dir / _result_json_filename(code, grade)
+
+    if output_json.exists() and not args.force_regenerate:
+        _log(f"[命中] 发现已预生成结果，直接返回: {output_json}")
+        payload = json.loads(output_json.read_text(encoding="utf-8"))
+        _log(f"输出JSON: {output_json}")
+        return
 
     effective_promo_index_file = (
         _to_abs_path(args.promo_index_file, workspace)
@@ -1124,14 +1179,9 @@ def main() -> None:
                 "total": _ms(main_total_start),
             },
         }
-        output_json = out_dir / f"{code}_query_result.json"
         output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        latest_json = args.output_dir / code / f"{code}_query_result.json"
-        latest_json.parent.mkdir(parents=True, exist_ok=True)
-        latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         _log(payload["message"])
         _log(f"输出JSON: {output_json}")
-        _log(f"输出JSON(兼容路径): {latest_json}")
         _log(f"[耗时] 总耗时: {_ms(main_total_start)}ms")
         return
 
@@ -1149,17 +1199,40 @@ def main() -> None:
     _log(f"[耗时] VIP阶段总耗时: {vip_ms}ms")
 
     apply_stage_start = perf_counter()
-    modified_result = apply_grade_to_promo(
-        code=code,
-        grade=grade,
-        promo_file=promo_file,
-        vip_records=vip_result["records"],
-        snapshot_engine=args.snapshot_engine,
-        out_dir=out_dir,
-        include_sheets=promo_result.get("matched_sheets"),
-        source_tables=promo_tables,
-    )
-    apply_ms = _ms(apply_stage_start)
+    if not _vip_has_grade_data(vip_result.get("records", []), grade):
+        _log(f"[覆盖] structured中未找到产品代码 {code} 的 {grade} 等级有效数据，跳过覆盖与 promo_modified_snapshots 生成")
+        modified_result = {
+            "grade": grade,
+            "modified_excel": "",
+            "matched_table_count": 0,
+            "update_logs": [],
+            "modified_tables": [],
+            "snapshots": [],
+            "engine": args.snapshot_engine,
+            "skipped": True,
+            "skip_reason": f"structured.json 中缺少产品代码 {code} 的 {grade} 等级有效数据",
+            "timing_ms": {
+                "extract_source": 0,
+                "match_rows": 0,
+                "write_excel": 0,
+                "reextract_modified": 0,
+                "snapshot": 0,
+                "total": 0,
+            },
+        }
+        apply_ms = 0
+    else:
+        modified_result = apply_grade_to_promo(
+            code=code,
+            grade=grade,
+            promo_file=promo_file,
+            vip_records=vip_result["records"],
+            snapshot_engine=args.snapshot_engine,
+            out_dir=out_dir,
+            include_sheets=promo_result.get("matched_sheets"),
+            source_tables=promo_tables,
+        )
+        apply_ms = _ms(apply_stage_start)
     _log(f"[耗时] 覆盖阶段总耗时: {apply_ms}ms")
 
     total_ms = _ms(main_total_start)
@@ -1184,11 +1257,7 @@ def main() -> None:
         },
     }
 
-    output_json = out_dir / f"{code}_query_result.json"
     output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    latest_json = args.output_dir / code / f"{code}_query_result.json"
-    latest_json.parent.mkdir(parents=True, exist_ok=True)
-    latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"产品代码: {code}")
     print(f"等级: {grade}")
@@ -1200,7 +1269,6 @@ def main() -> None:
     print(f"覆盖后推广表匹配: {modified_result['matched_table_count']}")
     print(f"耗时(推广/VIP/覆盖/总计, ms): {promo_ms}/{vip_ms}/{apply_ms}/{total_ms}")
     print(f"输出JSON: {output_json}")
-    print(f"输出JSON(兼容路径): {latest_json}")
     print(f"推广截图目录: {out_dir / 'promo_snapshots'}")
     print(f"VIP截图目录: {out_dir / 'vip_snapshots'}")
     print(f"覆盖后推广截图目录: {out_dir / 'promo_modified_snapshots'}")

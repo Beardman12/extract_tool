@@ -5,12 +5,14 @@ import imaplib
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from datetime import datetime
 from email import message_from_bytes
 from email.header import decode_header
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 
 POLL_INTERVAL_SECONDS = 300
@@ -113,10 +115,10 @@ def decode_filename(part) -> Optional[str]:
         return filename
 
 
-def save_message_attachments(msg, subject_keyword: str) -> int:
+def save_message_attachments(msg, subject_keyword: str) -> Tuple[int, Optional[Path]]:
     subject = decode_mime_text(str(msg.get("Subject", "")))
     if subject_keyword not in subject:
-        return 0
+        return 0, None
 
     saved_count = 0
     folder_name = make_timestamp_folder()
@@ -159,8 +161,34 @@ def save_message_attachments(msg, subject_keyword: str) -> int:
 
     if saved_count == 0 and target_dir.exists() and not any(target_dir.iterdir()):
         target_dir.rmdir()
+        target_dir = None
 
-    return saved_count
+    return saved_count, target_dir
+
+
+def trigger_prebuild_for_batch(batch_dir: Path) -> None:
+    promo_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "推广报价表" in p.name for p in batch_dir.glob("*.xlsx"))
+    vip_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "直发产品定价" in p.name for p in batch_dir.glob("*.xlsx"))
+    if not (promo_found and vip_found):
+        print(f"[预生成] 跳过，批次目录内推广/VIP文件不完整: {batch_dir}")
+        return
+
+    script_cmd = [
+        sys.executable,
+        "-m",
+        "myproject.scripts.prebuild_batch_outputs",
+        "--batch-dir",
+        str(batch_dir),
+    ]
+    child_env = os.environ.copy()
+    src_dir = str((BASE_DIR / "src").resolve())
+    child_env["PYTHONPATH"] = src_dir if not child_env.get("PYTHONPATH") else src_dir + os.pathsep + child_env["PYTHONPATH"]
+    print(f"[预生成] 开始执行: {' '.join(script_cmd)}")
+    completed = subprocess.run(script_cmd, cwd=str(BASE_DIR), env=child_env)
+    if completed.returncode != 0:
+        print(f"[预生成] 执行失败，退出码: {completed.returncode}")
+    else:
+        print("[预生成] 执行完成")
 
 
 def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
@@ -197,9 +225,12 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
                 continue
 
             msg = message_from_bytes(raw_email)
-            saved = save_message_attachments(msg, subject_keyword)
+            saved, batch_dir = save_message_attachments(msg, subject_keyword)
             saved_total += saved
             seen_uids.add(uid)
+
+            if saved > 0 and batch_dir is not None:
+                trigger_prebuild_for_batch(batch_dir)
 
         return saved_total
 

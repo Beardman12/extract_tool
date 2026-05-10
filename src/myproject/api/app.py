@@ -246,6 +246,51 @@ class RunQueryRequest(BaseModel):
     country_match_config: Optional[str] = None
     vip_structured_json: Optional[str] = None
     rebuild_vip_structured_json: bool = False
+    source_tag: Optional[str] = None
+    force_regenerate: bool = False
+
+
+def _result_json_filename(code: str, grade: str) -> str:
+    return f"{code}_{grade}_query_result.json"
+
+
+def _safe_tag(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text).strip("_") or "run"
+
+
+def _resolve_source_tag_for_run(req: RunQueryRequest) -> Optional[str]:
+    if req.source_tag:
+        return _safe_tag(req.source_tag)
+
+    promo_file: Optional[Path] = None
+    vip_file: Optional[Path] = None
+    if req.promo_input:
+        promo_file = _resolve_promo_file(req.promo_input)
+    if req.vip_input:
+        vip_file = _resolve_vip_file(req.vip_input)
+
+    if promo_file is None or vip_file is None:
+        try:
+            promo_auto, vip_auto = _resolve_latest_pair_from_attachments(ATTACHMENT_ROOT)
+            promo_file = promo_file or promo_auto
+            vip_file = vip_file or vip_auto
+        except HTTPException:
+            return None
+
+    return _infer_source_tag_from_file(promo_file) or _infer_source_tag_from_file(vip_file)
+
+
+def _resolve_result_json_path(code: str, grade: str, source_tag: Optional[str]) -> Optional[Path]:
+    filename = _result_json_filename(code, grade)
+    if source_tag:
+        p = OUTPUT_DIR / "code_query" / source_tag / code / filename
+        return p if p.exists() else None
+
+    candidates = list((OUTPUT_DIR / "code_query").glob(f"*/{code}/{filename}"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 app = FastAPI(title="AI Price API", version="1.0.0")
@@ -394,6 +439,32 @@ def run_query(req: RunQueryRequest, request: Request):
         req.snapshot_engine,
     ]
 
+    source_tag = _resolve_source_tag_for_run(req)
+    prebuilt_json = _resolve_result_json_path(code=code, grade=grade, source_tag=source_tag)
+
+    if prebuilt_json is not None and prebuilt_json.exists() and not req.force_regenerate:
+        payload = json.loads(prebuilt_json.read_text(encoding="utf-8"))
+        output_json_url = _path_to_public_url(str(prebuilt_json), request)
+        image_urls = _collect_image_urls(payload, request)
+        return {
+            "command": [],
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "output_json": str(prebuilt_json),
+            "output_json_url": output_json_url,
+            "image_urls": image_urls,
+            "timing_ms": {
+                "subprocess_run": 0,
+                "load_result_json": 0,
+                "build_public_urls": 0,
+                "total": int((time.perf_counter() - t_total) * 1000),
+            },
+            "result": payload,
+            "cache_hit": True,
+            "source_tag": source_tag,
+        }
+
     if req.promo_input:
         cmd.extend(["--promo-input", req.promo_input])
     if req.vip_input:
@@ -408,6 +479,10 @@ def run_query(req: RunQueryRequest, request: Request):
         cmd.extend(["--vip-structured-json", req.vip_structured_json])
     if req.rebuild_vip_structured_json:
         cmd.append("--rebuild-vip-structured-json")
+    if source_tag:
+        cmd.extend(["--source-tag", source_tag])
+    if req.force_regenerate:
+        cmd.append("--force-regenerate")
 
     logger.info("执行查询命令: %s", " ".join(cmd))
     t = time.perf_counter()
@@ -427,7 +502,9 @@ def run_query(req: RunQueryRequest, request: Request):
     stdout_text = _decode_process_text(completed.stdout)
     stderr_text = _decode_process_text(completed.stderr)
 
-    output_json = OUTPUT_DIR / "code_query" / code / f"{code}_query_result.json"
+    output_json = _resolve_result_json_path(code=code, grade=grade, source_tag=source_tag)
+    if output_json is None:
+        output_json = prebuilt_json if prebuilt_json is not None else (OUTPUT_DIR / "code_query" / _result_json_filename(code, grade))
     payload: Optional[Dict[str, Any]] = None
     t = time.perf_counter()
     if output_json.exists():

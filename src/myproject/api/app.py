@@ -123,7 +123,21 @@ def _resolve_vip_file(vip_input: Optional[str]) -> Path:
     return vip
 
 
+def _infer_source_tag_from_file(file_path: Path) -> Optional[str]:
+    try:
+        rel = file_path.resolve().relative_to(ATTACHMENT_ROOT.resolve())
+    except Exception:
+        return None
+    parts = rel.parts
+    if len(parts) < 2:
+        return None
+    return parts[0]
+
+
 def _default_vip_structured_json(vip_file: Path) -> Path:
+    source_tag = _infer_source_tag_from_file(vip_file)
+    if source_tag:
+        return CACHE_DIR / source_tag / f"{vip_file.stem}_vip_structured.json"
     return CACHE_DIR / f"{vip_file.stem}_vip_structured.json"
 
 
@@ -272,7 +286,11 @@ def get_promo_options(
     logger.info("读取推广选项，文件=%s rebuild_index=%s（仅目录索引）", promo_file, rebuild_index)
 
     extractor = PricingExtractor(promo_file)
-    index_file = extractor.default_index_file()
+    source_tag = _infer_source_tag_from_file(promo_file)
+    if source_tag:
+        index_file = OUTPUT_DIR / "index" / source_tag / f"{promo_file.stem}_code_sheet_index.json"
+    else:
+        index_file = extractor.default_index_file()
 
     if rebuild_index or not index_file.exists():
         index_data = extractor.build_code_sheet_index()

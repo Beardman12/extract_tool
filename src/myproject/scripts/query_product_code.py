@@ -503,6 +503,14 @@ def _default_vip_structured_json(vip_file: Path) -> Path:
     return Path("output") / "cache" / f"{vip_file.stem}_vip_structured.json"
 
 
+def _default_promo_index_file(promo_file: Path, source_tag: str) -> Path:
+    return Path("output") / "index" / source_tag / f"{promo_file.stem}_code_sheet_index.json"
+
+
+def _default_vip_structured_json_by_batch(vip_file: Path, source_tag: str) -> Path:
+    return Path("output") / "cache" / source_tag / f"{vip_file.stem}_vip_structured.json"
+
+
 def query_promo(
     code: str,
     promo_file: Path,
@@ -1063,10 +1071,26 @@ def main() -> None:
     out_dir = args.output_dir / code / source_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    effective_promo_index_file = (
+        _to_abs_path(args.promo_index_file, workspace)
+        if args.promo_index_file is not None
+        else _to_abs_path(_default_promo_index_file(promo_file, source_tag), workspace)
+    )
+    effective_promo_index_file.parent.mkdir(parents=True, exist_ok=True)
+
+    effective_vip_structured_json = (
+        _to_abs_path(args.vip_structured_json, workspace)
+        if args.vip_structured_json is not None
+        else _to_abs_path(_default_vip_structured_json_by_batch(vip_file, source_tag), workspace)
+    )
+    effective_vip_structured_json.parent.mkdir(parents=True, exist_ok=True)
+
     _log(f"[开始] 产品代码={code}, 等级={grade}, 截图引擎={args.snapshot_engine}")
     _log(f"[输入] 推广文件: {promo_file}")
     _log(f"[输入] VIP文件: {vip_file}")
     _log(f"[输入] 来源标识: {source_tag}")
+    _log(f"[输入] 推广索引文件: {effective_promo_index_file}")
+    _log(f"[输入] VIP结构化JSON: {effective_vip_structured_json}")
 
     promo_stage_start = perf_counter()
     promo_result, promo_tables = query_promo(
@@ -1074,7 +1098,7 @@ def main() -> None:
         promo_file,
         args.snapshot_engine,
         out_dir,
-        index_file=args.promo_index_file,
+        index_file=effective_promo_index_file,
         rebuild_index=args.rebuild_promo_index,
     )
     promo_ms = _ms(promo_stage_start)
@@ -1118,7 +1142,7 @@ def main() -> None:
         vip_file,
         args.snapshot_engine,
         out_dir,
-        structured_json=args.vip_structured_json,
+        structured_json=effective_vip_structured_json,
         rebuild_structured_json=args.rebuild_vip_structured_json,
     )
     vip_ms = _ms(vip_stage_start)

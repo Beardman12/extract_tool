@@ -37,9 +37,10 @@ if not defined BASE_PY_MODE (
 echo [1/6] 检查 Python 虚拟环境...
 if not exist ".venv\Scripts\python.exe" (
   echo 未检测到 .venv，开始创建...
-  call :RunBasePython -m venv .venv
+  call :CreateVenv ".venv"
   if errorlevel 1 (
     echo 创建虚拟环境失败。
+    echo 请在脚本顶部配置 PYTHON_EXE 指向 Python 3.14 的 python.exe。
     pause
     exit /b 1
   )
@@ -51,10 +52,12 @@ echo 校验虚拟环境 Python 版本...
 call :CheckPython314 "%PYTHON%"
 if errorlevel 1 (
   echo 当前 .venv Python 版本不满足要求 ^(>=3.14^)，将重建 .venv。
-  rmdir /s /q ".venv"
-  call :RunBasePython -m venv .venv
+  call :RebuildVenv ".venv"
   if errorlevel 1 (
     echo 重建虚拟环境失败。
+    echo 当前基础解释器模式: %BASE_PY_MODE%
+    if defined BASE_PY_EXE echo 当前基础解释器路径: %BASE_PY_EXE%
+    echo 建议在脚本顶部显式设置 PYTHON_EXE 为 Python 3.14 的绝对路径后重试。
     pause
     exit /b 1
   )
@@ -127,6 +130,21 @@ echo API: http://127.0.0.1:%API_PORT%/docs
 pause
 exit /b 0
 
+:CreateVenv
+call :RunBasePython -m venv "%~1"
+if errorlevel 1 exit /b 1
+if not exist "%~1\Scripts\python.exe" exit /b 1
+exit /b 0
+
+:RebuildVenv
+call :RunBasePython -m venv --clear "%~1"
+if errorlevel 1 (
+  call :RunBasePython -m venv "%~1"
+  if errorlevel 1 exit /b 1
+)
+if not exist "%~1\Scripts\python.exe" exit /b 1
+exit /b 0
+
 :RunBasePython
 if "%BASE_PY_MODE%"=="custom" (
   "%BASE_PY_EXE%" %*
@@ -134,11 +152,23 @@ if "%BASE_PY_MODE%"=="custom" (
 )
 if "%BASE_PY_MODE%"=="python" (
   python %*
-  exit /b %errorlevel%
+  if not errorlevel 1 exit /b 0
+  where py >nul 2>nul
+  if not errorlevel 1 (
+    py -3.14 %*
+    exit /b %errorlevel%
+  )
+  exit /b 1
 )
 if "%BASE_PY_MODE%"=="py" (
   py -3.14 %*
-  exit /b %errorlevel%
+  if not errorlevel 1 exit /b 0
+  where python >nul 2>nul
+  if not errorlevel 1 (
+    python %*
+    exit /b %errorlevel%
+  )
+  exit /b 1
 )
 exit /b 1
 

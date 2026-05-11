@@ -47,6 +47,29 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "PYTHON=%CD%\.venv\Scripts\python.exe"
 
+echo 校验虚拟环境 Python 版本...
+set "PY_VER_OK="
+for /f "usebackq delims=" %%V in (`"%PYTHON%" -c "import sys; print(1 if sys.version_info >= (3,14) else 0)"`) do set "PY_VER_OK=%%V"
+if not "%PY_VER_OK%"=="1" (
+  echo 当前 .venv Python 版本不满足要求 ^(>=3.14^)，将重建 .venv。
+  rmdir /s /q ".venv"
+  call :RunBasePython -m venv .venv
+  if errorlevel 1 (
+    echo 重建虚拟环境失败。
+    pause
+    exit /b 1
+  )
+  set "PYTHON=%CD%\.venv\Scripts\python.exe"
+  set "PY_VER_OK="
+  for /f "usebackq delims=" %%V in (`"%PYTHON%" -c "import sys; print(1 if sys.version_info >= (3,14) else 0)"`) do set "PY_VER_OK=%%V"
+  if not "%PY_VER_OK%"=="1" (
+    echo 仍未获得 Python 3.14+ 虚拟环境。
+    echo 如果你安装了多个 Python，请在脚本顶部配置 PYTHON_EXE 指向 3.14 的 python.exe。
+    pause
+    exit /b 1
+  )
+)
+
 echo [2/6] 自动检测 API 端口...
 set "API_PORT="
 for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ports=8003,8004,8005,8010,8080,9000; $chosen=0; foreach($p in $ports){ try{ $l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,$p); $l.Start(); $l.Stop(); $chosen=$p; break } catch {} }; Write-Output $chosen"`) do set "API_PORT=%%P"
@@ -116,7 +139,7 @@ if "%BASE_PY_MODE%"=="python" (
   exit /b %errorlevel%
 )
 if "%BASE_PY_MODE%"=="py" (
-  py -3 %*
+  py -3.14 %*
   exit /b %errorlevel%
 )
 exit /b 1

@@ -48,9 +48,8 @@ if not exist ".venv\Scripts\python.exe" (
 set "PYTHON=%CD%\.venv\Scripts\python.exe"
 
 echo 校验虚拟环境 Python 版本...
-set "PY_VER_OK="
-for /f "usebackq delims=" %%V in (`"%PYTHON%" -c "import sys; print(1 if sys.version_info >= (3,14) else 0)"`) do set "PY_VER_OK=%%V"
-if not "%PY_VER_OK%"=="1" (
+call :CheckPython314 "%PYTHON%"
+if errorlevel 1 (
   echo 当前 .venv Python 版本不满足要求 ^(>=3.14^)，将重建 .venv。
   rmdir /s /q ".venv"
   call :RunBasePython -m venv .venv
@@ -60,9 +59,8 @@ if not "%PY_VER_OK%"=="1" (
     exit /b 1
   )
   set "PYTHON=%CD%\.venv\Scripts\python.exe"
-  set "PY_VER_OK="
-  for /f "usebackq delims=" %%V in (`"%PYTHON%" -c "import sys; print(1 if sys.version_info >= (3,14) else 0)"`) do set "PY_VER_OK=%%V"
-  if not "%PY_VER_OK%"=="1" (
+  call :CheckPython314 "%PYTHON%"
+  if errorlevel 1 (
     echo 仍未获得 Python 3.14+ 虚拟环境。
     echo 如果你安装了多个 Python，请在脚本顶部配置 PYTHON_EXE 指向 3.14 的 python.exe。
     pause
@@ -141,5 +139,20 @@ if "%BASE_PY_MODE%"=="python" (
 if "%BASE_PY_MODE%"=="py" (
   py -3.14 %*
   exit /b %errorlevel%
+)
+exit /b 1
+
+:CheckPython314
+set "_CHECK_OUT=%TEMP%\pyver_check_%RANDOM%_%RANDOM%.txt"
+"%~1" -c "import sys; print(1 if sys.version_info >= (3,14) else 0)" > "%_CHECK_OUT%" 2>nul
+if errorlevel 1 (
+  del /q "%_CHECK_OUT%" >nul 2>nul
+  exit /b 1
+)
+set "_PY_VER_OK="
+set /p _PY_VER_OK=<"%_CHECK_OUT%"
+del /q "%_CHECK_OUT%" >nul 2>nul
+if "%_PY_VER_OK%"=="1" (
+  exit /b 0
 )
 exit /b 1

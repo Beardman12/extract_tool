@@ -120,41 +120,85 @@ def _safe_tag(text: str) -> str:
 
 
 def _find_existing_vip_snapshots(snapshot_dir: Path, code: str) -> List[Dict[str, Any]]:
-    target = snapshot_dir / f"{code.strip().upper()}_VIP.png"
-    if not target.exists():
+    paths = _find_existing_named_snapshots(snapshot_dir, f"{code.strip().upper()}_VIP")
+    out: List[Dict[str, Any]] = []
+    for p in paths:
+        out.append(
+            {
+                "产品代码": code.strip().upper(),
+                "snapshot": str(p),
+                "engine": "cached",
+                "reused": True,
+            }
+        )
+    return out
+
+
+def _find_existing_named_snapshots(snapshot_dir: Path, base_name: str) -> List[Path]:
+    if not snapshot_dir.exists():
         return []
-    return [
-        {
-            "产品代码": code.strip().upper(),
-            "snapshot": str(target),
-            "engine": "cached",
-            "reused": True,
-        }
-    ]
+
+    single = snapshot_dir / f"{base_name}.png"
+    numbered: List[Tuple[int, Path]] = []
+    for p in snapshot_dir.glob(f"{base_name}_*.png"):
+        m = re.fullmatch(rf"{re.escape(base_name)}_(\d+).png", p.name)
+        if m is None:
+            continue
+        numbered.append((int(m.group(1)), p))
+
+    if numbered:
+        numbered.sort(key=lambda x: x[0])
+        return [p for _, p in numbered]
+    if single.exists():
+        return [single]
+    return []
 
 
-def _normalize_single_snapshot(
+def _normalize_named_snapshots(
     generated_paths: List[str],
-    target_path: Path,
+    output_dir: Path,
+    base_name: str,
 ) -> List[str]:
-    if target_path.exists() and not generated_paths:
-        return [str(target_path)]
     if not generated_paths:
         return []
 
-    first = Path(generated_paths[0])
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    if first.resolve() != target_path.resolve():
-        shutil.copy2(first, target_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_paths = [Path(p) for p in generated_paths]
+    target_paths: List[Path] = []
 
-    for p_str in generated_paths:
-        p = Path(p_str)
+    if len(source_paths) == 1:
+        target_paths = [output_dir / f"{base_name}.png"]
+    else:
+        for idx in range(1, len(source_paths) + 1):
+            target_paths.append(output_dir / f"{base_name}_{idx:02d}.png")
+
+    for src, dst in zip(source_paths, target_paths):
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+
+    # 清理生成过程中的临时命名文件
+    target_resolved = {p.resolve() for p in target_paths}
+    for src in source_paths:
         try:
-            if p.resolve() != target_path.resolve() and p.exists():
-                p.unlink()
+            if src.exists() and src.resolve() not in target_resolved:
+                src.unlink()
         except Exception:
             continue
-    return [str(target_path)]
+
+    # 清理同前缀的历史文件，避免残留导致读取歧义
+    keep_names = {p.name for p in target_paths}
+    for p in output_dir.glob(f"{base_name}*.png"):
+        is_single = p.name == f"{base_name}.png"
+        is_numbered = re.fullmatch(rf"{re.escape(base_name)}_\d+.png", p.name) is not None
+        if not (is_single or is_numbered):
+            continue
+        if p.name not in keep_names:
+            try:
+                p.unlink()
+            except Exception:
+                continue
+
+    return [str(p) for p in target_paths]
 
 
 def _is_prebuilt_payload_compatible(payload: Dict[str, Any], out_dir: Path, code: str, grade: str) -> bool:
@@ -165,18 +209,19 @@ def _is_prebuilt_payload_compatible(payload: Dict[str, Any], out_dir: Path, code
     vip = payload.get("VIP等级报价", {}) if isinstance(payload, dict) else {}
     modified = payload.get("推广报价_按等级覆盖后", {}) if isinstance(payload, dict) else {}
 
-    expected_files: List[Path] = []
-
     if int(promo.get("matched_count", 0)) > 0:
-        expected_files.append(out_dir / "promo_snapshots" / f"{code_u}_PROMO.png")
+        if not _find_existing_named_snapshots(out_dir / "promo_snapshots", f"{code_u}_PROMO"):
+            return False
 
     if int(vip.get("matched_block_count", 0)) > 0:
-        expected_files.append(out_dir / "vip_snapshots" / f"{code_u}_VIP.png")
+        if not _find_existing_named_snapshots(out_dir / "vip_snapshots", f"{code_u}_VIP"):
+            return False
 
     if not bool(modified.get("skipped", False)) and int(modified.get("matched_table_count", 0)) > 0:
-        expected_files.append(out_dir / "promo_modified_snapshots" / f"{code_u}_{grade_u}_PROMO.png")
+        if not _find_existing_named_snapshots(out_dir / "promo_modified_snapshots", f"{code_u}_{grade_u}_PROMO"):
+            return False
 
-    return all(p.exists() for p in expected_files)
+    return True
 
 
 def _infer_source_tag_from_file(file_path: Path, attachment_root: Path) -> Optional[str]:
@@ -520,7 +565,14 @@ def _weight_match(promo_weight: str, vip_weight: str, tol: float = 0.02) -> bool
 
     p_low, p_high = p_range
     v_low, v_high = v_range
-    return abs(p_low - v_low) <= tol and abs(p_high - v_high) <= tol
+    # 1) 边界近似相等
+    if abs(p_low - v_low) <= tol and abs(p_high - v_high) <= tol:
+        return True
+
+    # 2) 支持区间包含：VIP给大区间(如 0-5)时，可匹配推广子区间(如 0-0.3 / 0.3-0.5)
+    promo_in_vip = p_low >= v_low - tol and p_high <= v_high + tol
+    vip_in_promo = v_low >= p_low - tol and v_high <= p_high + tol
+    return promo_in_vip or vip_in_promo
 
 
 def _weight_distance(promo_weight: str, vip_weight: str) -> float:
@@ -677,13 +729,14 @@ def query_promo(
     snapshots: List[str] = []
     used_engine = snapshot_engine
     snapshot_ms = 0
-    promo_named_snapshot = snapshot_dir / f"{code}_PROMO.png"
+    promo_snapshot_base = f"{code}_PROMO"
 
     if matched:
-        if reuse_snapshots and promo_named_snapshot.exists():
-            snapshots = [str(promo_named_snapshot)]
+        existing = _find_existing_named_snapshots(snapshot_dir, promo_snapshot_base) if reuse_snapshots else []
+        if existing:
+            snapshots = [str(p) for p in existing]
             used_engine = "cached"
-            _log(f"[推广] 命中产品线数量: {len(matched)}，复用已有截图: {promo_named_snapshot}")
+            _log(f"[推广] 命中产品线数量: {len(matched)}，复用已有截图: {len(existing)} 张")
         else:
             _log(f"[推广] 命中产品线数量: {len(matched)}，开始生成截图（{snapshot_engine}）")
             snapshot_start = perf_counter()
@@ -698,7 +751,7 @@ def query_promo(
             else:
                 paths = extractor.save_snapshots(matched, snapshot_dir)
 
-            snapshots = _normalize_single_snapshot([str(p) for p in paths], promo_named_snapshot)
+            snapshots = _normalize_named_snapshots([str(p) for p in paths], snapshot_dir, promo_snapshot_base)
             snapshot_ms = _ms(snapshot_start)
             _log(f"[推广] 截图耗时: {snapshot_ms}ms")
 
@@ -1044,12 +1097,13 @@ def apply_grade_to_promo(
 
     snapshot_dir = out_dir / "promo_modified_snapshots"
     used_engine = snapshot_engine
-    named_snapshot = snapshot_dir / f"{code}_{grade}_PROMO.png"
-    if reuse_snapshots and named_snapshot.exists():
-        snap_paths = [named_snapshot]
+    modified_snapshot_base = f"{code}_{grade}_PROMO"
+    existing_modified = _find_existing_named_snapshots(snapshot_dir, modified_snapshot_base) if reuse_snapshots else []
+    if existing_modified:
+        snap_paths = existing_modified
         used_engine = "cached"
         snapshot_ms = 0
-        _log(f"[覆盖] 复用已有覆盖截图: {named_snapshot}")
+        _log(f"[覆盖] 复用已有覆盖截图: {len(existing_modified)} 张")
     else:
         _log(f"[覆盖] 开始生成覆盖后截图（{snapshot_engine}）")
         snapshot_start = perf_counter()
@@ -1064,7 +1118,7 @@ def apply_grade_to_promo(
                 raw_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
         else:
             raw_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
-        snap_paths = [Path(p) for p in _normalize_single_snapshot([str(p) for p in raw_paths], named_snapshot)]
+        snap_paths = [Path(p) for p in _normalize_named_snapshots([str(p) for p in raw_paths], snapshot_dir, modified_snapshot_base)]
         snapshot_ms = _ms(snapshot_start)
         _log(f"[覆盖] 截图耗时: {snapshot_ms}ms")
 

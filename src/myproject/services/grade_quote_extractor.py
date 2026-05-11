@@ -562,7 +562,16 @@ class GradeQuoteExtractor:
     ) -> List[Dict[str, Any]]:
         output_dir.mkdir(parents=True, exist_ok=True)
         snapshots: List[Dict[str, Any]] = []
-        processed_codes: set[str] = set()
+
+        total_by_code: Dict[str, int] = {}
+        for block in blocks:
+            for code in block.service_codes:
+                code_u = str(code).strip().upper()
+                if not code_u:
+                    continue
+                total_by_code[code_u] = total_by_code.get(code_u, 0) + 1
+
+        index_by_code: Dict[str, int] = {}
 
         header_rows = [header_row, header_row + 1]
         left_col = cm.product_name_col
@@ -573,12 +582,19 @@ class GradeQuoteExtractor:
                 continue
 
             for code in block.service_codes:
-                if code in processed_codes:
+                code_u = str(code).strip().upper()
+                if not code_u:
                     continue
-                processed_codes.add(code)
 
-                code_part = self._safe_filename(code)
-                file_name = f"{code_part}_VIP.png"
+                nth = index_by_code.get(code_u, 0) + 1
+                index_by_code[code_u] = nth
+                total = total_by_code.get(code_u, 1)
+
+                code_part = self._safe_filename(code_u)
+                if total <= 1:
+                    file_name = f"{code_part}_VIP.png"
+                else:
+                    file_name = f"{code_part}_VIP_{nth:02d}.png"
                 file_path = output_dir / file_name
 
                 selected_rows = header_rows + list(range(block.start_row, block.end_row + 1))
@@ -630,6 +646,28 @@ class GradeQuoteExtractor:
                         "engine": used_engine,
                     }
                 )
+
+        # 清理历史残留命名，确保目录命名规则稳定：
+        # 单图=CODE_VIP.png；多图=CODE_VIP_01.png, CODE_VIP_02.png...
+        for code_u, total in total_by_code.items():
+            code_part = self._safe_filename(code_u)
+            keep: set[str] = set()
+            if total <= 1:
+                keep.add(f"{code_part}_VIP.png")
+            else:
+                for i in range(1, total + 1):
+                    keep.add(f"{code_part}_VIP_{i:02d}.png")
+
+            for p in output_dir.glob(f"{code_part}_VIP*.png"):
+                is_single = p.name == f"{code_part}_VIP.png"
+                is_numbered = re.fullmatch(rf"{re.escape(code_part)}_VIP_\d+.png", p.name) is not None
+                if not (is_single or is_numbered):
+                    continue
+                if p.name not in keep:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
 
         return snapshots
 

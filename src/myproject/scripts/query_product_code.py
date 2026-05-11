@@ -119,6 +119,66 @@ def _safe_tag(text: str) -> str:
     return s or "run"
 
 
+def _find_existing_vip_snapshots(snapshot_dir: Path, code: str) -> List[Dict[str, Any]]:
+    target = snapshot_dir / f"{code.strip().upper()}_VIP.png"
+    if not target.exists():
+        return []
+    return [
+        {
+            "产品代码": code.strip().upper(),
+            "snapshot": str(target),
+            "engine": "cached",
+            "reused": True,
+        }
+    ]
+
+
+def _normalize_single_snapshot(
+    generated_paths: List[str],
+    target_path: Path,
+) -> List[str]:
+    if target_path.exists() and not generated_paths:
+        return [str(target_path)]
+    if not generated_paths:
+        return []
+
+    first = Path(generated_paths[0])
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if first.resolve() != target_path.resolve():
+        shutil.copy2(first, target_path)
+
+    for p_str in generated_paths:
+        p = Path(p_str)
+        try:
+            if p.resolve() != target_path.resolve() and p.exists():
+                p.unlink()
+        except Exception:
+            continue
+    return [str(target_path)]
+
+
+def _is_prebuilt_payload_compatible(payload: Dict[str, Any], out_dir: Path, code: str, grade: str) -> bool:
+    code_u = code.strip().upper()
+    grade_u = grade.strip().upper()
+
+    promo = payload.get("推广报价", {}) if isinstance(payload, dict) else {}
+    vip = payload.get("VIP等级报价", {}) if isinstance(payload, dict) else {}
+    modified = payload.get("推广报价_按等级覆盖后", {}) if isinstance(payload, dict) else {}
+
+    expected_files: List[Path] = []
+
+    if int(promo.get("matched_count", 0)) > 0:
+        expected_files.append(out_dir / "promo_snapshots" / f"{code_u}_PROMO.png")
+
+    if int(vip.get("matched_block_count", 0)) > 0:
+        expected_files.append(out_dir / "vip_snapshots" / f"{code_u}_VIP.png")
+
+    if not bool(modified.get("skipped", False)) and int(modified.get("matched_table_count", 0)) > 0:
+        expected_files.append(out_dir / "promo_modified_snapshots" / f"{code_u}_{grade_u}_PROMO.png")
+
+    return all(p.exists() for p in expected_files)
+
+
 def _infer_source_tag_from_file(file_path: Path, attachment_root: Path) -> Optional[str]:
     try:
         rel = file_path.resolve().relative_to(attachment_root.resolve())
@@ -546,6 +606,7 @@ def query_promo(
     out_dir: Path,
     index_file: Optional[Path] = None,
     rebuild_index: bool = False,
+    reuse_snapshots: bool = True,
 ) -> Tuple[Dict[str, Any], List[ProductLineTable]]:
     promo_total_start = perf_counter()
     init_start = perf_counter()
@@ -616,24 +677,30 @@ def query_promo(
     snapshots: List[str] = []
     used_engine = snapshot_engine
     snapshot_ms = 0
+    promo_named_snapshot = snapshot_dir / f"{code}_PROMO.png"
 
     if matched:
-        _log(f"[推广] 命中产品线数量: {len(matched)}，开始生成截图（{snapshot_engine}）")
-        snapshot_start = perf_counter()
-        if snapshot_engine == "com":
-            try:
-                paths = extractor.save_snapshots_com(matched, snapshot_dir)
-            except Exception as exc:
-                _log(f"[推广] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
-                _log(f"[推广] COM截图堆栈:\n{traceback.format_exc()}")
-                used_engine = "draw"
-                paths = extractor.save_snapshots(matched, snapshot_dir)
+        if reuse_snapshots and promo_named_snapshot.exists():
+            snapshots = [str(promo_named_snapshot)]
+            used_engine = "cached"
+            _log(f"[推广] 命中产品线数量: {len(matched)}，复用已有截图: {promo_named_snapshot}")
         else:
-            paths = extractor.save_snapshots(matched, snapshot_dir)
+            _log(f"[推广] 命中产品线数量: {len(matched)}，开始生成截图（{snapshot_engine}）")
+            snapshot_start = perf_counter()
+            if snapshot_engine == "com":
+                try:
+                    paths = extractor.save_snapshots_com(matched, snapshot_dir)
+                except Exception as exc:
+                    _log(f"[推广] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
+                    _log(f"[推广] COM截图堆栈:\n{traceback.format_exc()}")
+                    used_engine = "draw"
+                    paths = extractor.save_snapshots(matched, snapshot_dir)
+            else:
+                paths = extractor.save_snapshots(matched, snapshot_dir)
 
-        snapshots = [str(p) for p in paths]
-        snapshot_ms = _ms(snapshot_start)
-        _log(f"[推广] 截图耗时: {snapshot_ms}ms")
+            snapshots = _normalize_single_snapshot([str(p) for p in paths], promo_named_snapshot)
+            snapshot_ms = _ms(snapshot_start)
+            _log(f"[推广] 截图耗时: {snapshot_ms}ms")
 
     total_ms = _ms(promo_total_start)
     _log(f"[推广] 完成，匹配 {len(matched)}，截图 {len(snapshots)}，总耗时 {total_ms}ms")
@@ -678,6 +745,8 @@ def query_vip(
     out_dir: Path,
     structured_json: Optional[Path] = None,
     rebuild_structured_json: bool = False,
+    reuse_snapshots: bool = True,
+    skip_snapshot_generation: bool = False,
 ) -> Dict[str, Any]:
     vip_total_start = perf_counter()
     _log(f"[VIP] 开始读取: {vip_file}")
@@ -726,6 +795,28 @@ def query_vip(
     _log(f"[VIP] 代码筛选与块准备耗时: {prepare_blocks_ms}ms")
 
     snapshot_dir = out_dir / "vip_snapshots"
+    if skip_snapshot_generation:
+        existing = _find_existing_vip_snapshots(snapshot_dir, code)
+        if existing:
+            _log(f"[VIP] 跳过截图生成，复用已有截图: {len(existing)} 张")
+            total_ms = _ms(vip_total_start)
+            return {
+                "input_excel": str(vip_file),
+                "structured_json": str(structured_file),
+                "grade": grade,
+                "matched_record_count": len(records),
+                "matched_block_count": len(blocks_for_code),
+                "records": records,
+                "by_product_code": by_code,
+                "snapshots": existing,
+                "timing_ms": {
+                    "prepare_structured": structured_prepare_ms,
+                    "prepare_blocks": prepare_blocks_ms,
+                    "snapshot": 0,
+                    "total": total_ms,
+                },
+            }
+
     _log(f"[VIP] 命中记录 {len(records)}，命中块 {len(blocks_for_code)}，开始生成截图（{snapshot_engine}）")
     snapshot_start = perf_counter()
     snapshot_items = extractor.save_block_snapshots(
@@ -734,6 +825,7 @@ def query_vip(
         cm=cm,
         output_dir=snapshot_dir,
         engine=snapshot_engine,
+        reuse_existing=reuse_snapshots,
     )
     snapshot_ms = _ms(snapshot_start)
     _log(f"[VIP] 截图耗时: {snapshot_ms}ms")
@@ -768,6 +860,7 @@ def apply_grade_to_promo(
     out_dir: Path,
     include_sheets: Optional[List[str]] = None,
     source_tables: Optional[List[ProductLineTable]] = None,
+    reuse_snapshots: bool = True,
 ) -> Dict[str, Any]:
     apply_total_start = perf_counter()
     _log(f"[覆盖] 开始按等级 {grade} 覆盖推广报价")
@@ -951,21 +1044,29 @@ def apply_grade_to_promo(
 
     snapshot_dir = out_dir / "promo_modified_snapshots"
     used_engine = snapshot_engine
-    _log(f"[覆盖] 开始生成覆盖后截图（{snapshot_engine}）")
-    snapshot_start = perf_counter()
-    modified_extractor = PricingExtractor(modified_excel)
-    if snapshot_engine == "com":
-        try:
-            snap_paths = modified_extractor.save_snapshots_com(modified_tables, snapshot_dir)
-        except Exception as exc:
-            _log(f"[覆盖] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
-            _log(f"[覆盖] COM截图堆栈:\n{traceback.format_exc()}")
-            used_engine = "draw"
-            snap_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
+    named_snapshot = snapshot_dir / f"{code}_{grade}_PROMO.png"
+    if reuse_snapshots and named_snapshot.exists():
+        snap_paths = [named_snapshot]
+        used_engine = "cached"
+        snapshot_ms = 0
+        _log(f"[覆盖] 复用已有覆盖截图: {named_snapshot}")
     else:
-        snap_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
-    snapshot_ms = _ms(snapshot_start)
-    _log(f"[覆盖] 截图耗时: {snapshot_ms}ms")
+        _log(f"[覆盖] 开始生成覆盖后截图（{snapshot_engine}）")
+        snapshot_start = perf_counter()
+        modified_extractor = PricingExtractor(modified_excel)
+        if snapshot_engine == "com":
+            try:
+                raw_paths = modified_extractor.save_snapshots_com(modified_tables, snapshot_dir)
+            except Exception as exc:
+                _log(f"[覆盖] COM截图失败，自动回退 draw。异常: {type(exc).__name__}: {exc}")
+                _log(f"[覆盖] COM截图堆栈:\n{traceback.format_exc()}")
+                used_engine = "draw"
+                raw_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
+        else:
+            raw_paths = modified_extractor.save_snapshots(modified_tables, snapshot_dir)
+        snap_paths = [Path(p) for p in _normalize_single_snapshot([str(p) for p in raw_paths], named_snapshot)]
+        snapshot_ms = _ms(snapshot_start)
+        _log(f"[覆盖] 截图耗时: {snapshot_ms}ms")
 
     total_ms = _ms(apply_total_start)
     _log(f"[覆盖] 完成，截图 {len(snap_paths)}，总耗时 {total_ms}ms")
@@ -1027,6 +1128,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-regenerate",
         action="store_true",
         help="强制重建，不使用已预生成的同 code+grade 结果",
+    )
+    parser.add_argument(
+        "--skip-vip-snapshot-generation",
+        action="store_true",
+        help="跳过VIP截图生成；若已有同产品代码截图则直接复用",
     )
     parser.add_argument(
         "--snapshot-engine",
@@ -1121,10 +1227,12 @@ def main() -> None:
     output_json = out_dir / _result_json_filename(code, grade)
 
     if output_json.exists() and not args.force_regenerate:
-        _log(f"[命中] 发现已预生成结果，直接返回: {output_json}")
         payload = json.loads(output_json.read_text(encoding="utf-8"))
-        _log(f"输出JSON: {output_json}")
-        return
+        if _is_prebuilt_payload_compatible(payload, out_dir, code, grade):
+            _log(f"[命中] 发现已预生成结果，直接返回: {output_json}")
+            _log(f"输出JSON: {output_json}")
+            return
+        _log(f"[命中] 发现旧格式预生成结果，自动重建: {output_json}")
 
     effective_promo_index_file = (
         _to_abs_path(args.promo_index_file, workspace)
@@ -1155,6 +1263,7 @@ def main() -> None:
         out_dir,
         index_file=effective_promo_index_file,
         rebuild_index=args.rebuild_promo_index,
+        reuse_snapshots=not args.force_regenerate,
     )
     promo_ms = _ms(promo_stage_start)
     _log(f"[耗时] 推广阶段总耗时: {promo_ms}ms")
@@ -1194,6 +1303,8 @@ def main() -> None:
         out_dir,
         structured_json=effective_vip_structured_json,
         rebuild_structured_json=args.rebuild_vip_structured_json,
+        reuse_snapshots=not args.force_regenerate,
+        skip_snapshot_generation=args.skip_vip_snapshot_generation,
     )
     vip_ms = _ms(vip_stage_start)
     _log(f"[耗时] VIP阶段总耗时: {vip_ms}ms")
@@ -1231,6 +1342,7 @@ def main() -> None:
             out_dir=out_dir,
             include_sheets=promo_result.get("matched_sheets"),
             source_tables=promo_tables,
+            reuse_snapshots=not args.force_regenerate,
         )
         apply_ms = _ms(apply_stage_start)
     _log(f"[耗时] 覆盖阶段总耗时: {apply_ms}ms")

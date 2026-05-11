@@ -78,6 +78,7 @@ def _run_query_for_code_grade(
     snapshot_engine: str,
     output_dir: Path,
     force_regenerate: bool,
+    skip_vip_snapshot_generation: bool,
 ) -> int:
     cmd = [
         sys.executable,
@@ -104,6 +105,8 @@ def _run_query_for_code_grade(
     ]
     if force_regenerate:
         cmd.append("--force-regenerate")
+    if skip_vip_snapshot_generation:
+        cmd.append("--skip-vip-snapshot-generation")
 
     child_env = os.environ.copy()
     src_dir = str((Path.cwd() / "src").resolve())
@@ -145,7 +148,7 @@ def main() -> None:
     total = 0
     failed = 0
     for code in codes:
-        for grade in GRADES:
+        for idx, grade in enumerate(GRADES):
             total += 1
             rc = _run_query_for_code_grade(
                 code=code,
@@ -158,6 +161,7 @@ def main() -> None:
                 snapshot_engine=args.snapshot_engine,
                 output_dir=args.output_dir,
                 force_regenerate=args.force_regenerate,
+                skip_vip_snapshot_generation=(idx > 0),
             )
             if rc != 0:
                 failed += 1

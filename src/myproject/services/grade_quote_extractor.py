@@ -150,6 +150,40 @@ class GradeQuoteExtractor:
         return cleaned or "unnamed"
 
     @staticmethod
+    def _display_len(text: str) -> int:
+        total = 0
+        for ch in text:
+            if "\u4e00" <= ch <= "\u9fff" or "\uff01" <= ch <= "\uff60":
+                total += 2
+            else:
+                total += 1
+        return max(1, total)
+
+    @classmethod
+    def _wrap_text_by_chars(cls, text: str, max_chars: int) -> str:
+        max_chars = max(1, max_chars)
+        lines: List[str] = []
+        for raw in text.splitlines() or [text]:
+            s = raw.strip()
+            if not s:
+                lines.append("")
+                continue
+            buf = ""
+            width = 0
+            for ch in s:
+                ch_w = 2 if ("\u4e00" <= ch <= "\u9fff" or "\uff01" <= ch <= "\uff60") else 1
+                if width + ch_w > max_chars and buf:
+                    lines.append(buf)
+                    buf = ch
+                    width = ch_w
+                else:
+                    buf += ch
+                    width += ch_w
+            if buf:
+                lines.append(buf)
+        return "\n".join(lines)
+
+    @staticmethod
     def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         candidates = [
             "C:/Windows/Fonts/msyh.ttc",
@@ -334,6 +368,18 @@ class GradeQuoteExtractor:
         output_path: Path,
     ) -> None:
         rows = list(range(top_row, bottom_row + 1))
+        self._render_snapshot_draw_rows(rows, left_col, right_col, output_path)
+
+    def _render_snapshot_draw_rows(
+        self,
+        rows: List[int],
+        left_col: int,
+        right_col: int,
+        output_path: Path,
+    ) -> None:
+        rows = sorted(set(rows))
+        if not rows:
+            raise ValueError("截图行集合为空")
         cols = list(range(left_col, right_col + 1))
 
         col_px: Dict[int, int] = {}
@@ -345,12 +391,69 @@ class GradeQuoteExtractor:
                 width = 12
             col_px[c] = max(70, int(float(width) * 8))
 
+        # 按内容自适应列宽，避免长文本完全挤压在窄列中。
+        for c in cols:
+            max_content_len = 0
+            for r in rows:
+                anchor = self.merged_lookup.get((r, c))
+                if anchor is not None and anchor != (r, c):
+                    continue
+                txt = self._text(self._value(r, c)).replace("\n", " ").strip()
+                if not txt:
+                    continue
+                max_content_len = max(max_content_len, self._display_len(txt))
+            if max_content_len > 0:
+                col_px[c] = max(col_px[c], min(320, 24 + max_content_len * 7))
+
         for r in rows:
             height = self.ws.row_dimensions[r].height
             if height is None:
                 height = 20
             row_px[r] = max(24, int(float(height) * 1.6))
 
+        # 锚点 -> 合并范围，用于一次性绘制完整合并单元格。
+        merged_anchor_span: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+        for merged_range in self.ws.merged_cells.ranges:
+            anchor = (merged_range.min_row, merged_range.min_col)
+            merged_anchor_span[anchor] = (
+                merged_range.min_row,
+                merged_range.max_row,
+                merged_range.min_col,
+                merged_range.max_col,
+            )
+
+        # 按单元格内容自适应行高（含合并单元格文本）。
+        for r in rows:
+            for c in cols:
+                anchor = self.merged_lookup.get((r, c))
+                if anchor is not None and anchor != (r, c):
+                    continue
+
+                txt = self._text(self._value(r, c)).replace("\n", " ").strip()
+                if not txt:
+                    continue
+
+                if anchor is not None and anchor == (r, c):
+                    min_row, max_row, min_col, max_col = merged_anchor_span.get(anchor, (r, r, c, c))
+                else:
+                    min_row, max_row, min_col, max_col = (r, r, c, c)
+
+                span_rows = [rr for rr in rows if min_row <= rr <= max_row]
+                span_cols = [cc for cc in cols if min_col <= cc <= max_col]
+                if not span_rows or not span_cols:
+                    continue
+
+                text_width_px = max(40, sum(col_px[cc] for cc in span_cols) - 8)
+                chars_per_line = max(1, int(text_width_px / 8))
+                wrapped = self._wrap_text_by_chars(txt, chars_per_line)
+                line_count = max(1, len(wrapped.splitlines()))
+                needed_height = 10 + line_count * 18
+
+                per_row = max(24, int((needed_height + len(span_rows) - 1) / len(span_rows)))
+                for rr in span_rows:
+                    row_px[rr] = max(row_px[rr], per_row)
+
+        # 行高自适应完成后再计算画布和坐标，避免文本被裁切。
         total_w = sum(col_px[c] for c in cols) + 2
         total_h = sum(row_px[r] for r in rows) + 2
 
@@ -358,16 +461,54 @@ class GradeQuoteExtractor:
         draw = ImageDraw.Draw(image)
         font = self._load_font(14)
 
+        x_start_by_col: Dict[int, int] = {}
+        y_start_by_row: Dict[int, int] = {}
+        x_cursor = 1
+        for c in cols:
+            x_start_by_col[c] = x_cursor
+            x_cursor += col_px[c]
+        y_cursor = 1
+        for r in rows:
+            y_start_by_row[r] = y_cursor
+            y_cursor += row_px[r]
+
         y = 1
         for r in rows:
             x = 1
             for c in cols:
                 cw = col_px[c]
                 rh = row_px[r]
-                draw.rectangle([x, y, x + cw, y + rh], outline=(0, 0, 0), width=1)
-                txt = self._text(self._value(r, c)).replace("\n", " ")
+                anchor = self.merged_lookup.get((r, c))
+
+                # 非锚点的合并单元格不重复绘制，避免内部网格线破坏合并效果。
+                if anchor is not None and anchor != (r, c):
+                    x += cw
+                    continue
+
+                if anchor is not None and anchor == (r, c):
+                    min_row, max_row, min_col, max_col = merged_anchor_span.get(anchor, (r, r, c, c))
+                    span_rows = [rr for rr in rows if min_row <= rr <= max_row]
+                    span_cols = [cc for cc in cols if min_col <= cc <= max_col]
+
+                    if span_rows and span_cols:
+                        x0 = x_start_by_col[span_cols[0]]
+                        y0 = y_start_by_row[span_rows[0]]
+                        x1 = x0 + sum(col_px[cc] for cc in span_cols)
+                        y1 = y0 + sum(row_px[rr] for rr in span_rows)
+                        draw.rectangle([x0, y0, x1, y1], outline=(0, 0, 0), width=1)
+
+                    txt = self._text(self._value(r, c)).replace("\n", " ")
+                    text_width_px = max(40, sum(col_px[cc] for cc in span_cols) - 8)
+                    chars_per_line = max(1, int(text_width_px / 8))
+                    txt = self._wrap_text_by_chars(txt, chars_per_line)
+                else:
+                    draw.rectangle([x, y, x + cw, y + rh], outline=(0, 0, 0), width=1)
+                    txt = self._text(self._value(r, c)).replace("\n", " ")
+                    chars_per_line = max(1, int(max(40, cw - 8) / 8))
+                    txt = self._wrap_text_by_chars(txt, chars_per_line)
+
                 if txt:
-                    draw.text((x + 4, y + 4), txt, fill=(0, 0, 0), font=font)
+                    draw.multiline_text((x + 4, y + 4), txt, fill=(0, 0, 0), font=font, spacing=4)
                 x += cw
             y += row_px[r]
 
@@ -417,11 +558,13 @@ class GradeQuoteExtractor:
         cm: GradeColumnMap,
         output_dir: Path,
         engine: str = "com",
+        reuse_existing: bool = True,
     ) -> List[Dict[str, Any]]:
         output_dir.mkdir(parents=True, exist_ok=True)
         snapshots: List[Dict[str, Any]] = []
+        processed_codes: set[str] = set()
 
-        top_row = header_row
+        header_rows = [header_row, header_row + 1]
         left_col = cm.product_name_col
         right_col = cm.external_effective_time_col
 
@@ -430,21 +573,47 @@ class GradeQuoteExtractor:
                 continue
 
             for code in block.service_codes:
+                if code in processed_codes:
+                    continue
+                processed_codes.add(code)
+
                 code_part = self._safe_filename(code)
-                name_part = self._safe_filename(block.product_name[:20])
-                file_name = f"{idx:03d}_{code_part}_{name_part}_r{block.start_row}-{block.end_row}.png"
+                file_name = f"{code_part}_VIP.png"
                 file_path = output_dir / file_name
+
+                selected_rows = header_rows + list(range(block.start_row, block.end_row + 1))
+                selected_rows = sorted(set(selected_rows))
+
+                if reuse_existing and file_path.exists():
+                    snapshots.append(
+                        {
+                            "产品代码": code,
+                            "产品名称": block.product_name,
+                            "服务代码原文": block.service_text,
+                            "row_range": f"{block.start_row}-{block.end_row}",
+                            "range": {
+                                "top_left": f"{get_column_letter(left_col)}{selected_rows[0]}",
+                                "bottom_right": f"{get_column_letter(right_col)}{selected_rows[-1]}",
+                            },
+                            "selected_rows": selected_rows,
+                            "snapshot": str(file_path),
+                            "engine": "cached",
+                        }
+                    )
+                    continue
 
                 used_engine = engine
                 try:
                     if engine == "com":
-                        self._render_snapshot_com(top_row, block.end_row, left_col, right_col, file_path)
+                        # 需求要求只截取“表头+当前产品代码块”；COM连续区域无法精确表达离散行，故使用draw。
+                        used_engine = "draw"
+                        self._render_snapshot_draw_rows(selected_rows, left_col, right_col, file_path)
                     else:
-                        self._render_snapshot_draw(top_row, block.end_row, left_col, right_col, file_path)
+                        self._render_snapshot_draw_rows(selected_rows, left_col, right_col, file_path)
                 except Exception:
                     # COM不可用时自动回退，确保有截图产出
                     used_engine = "draw"
-                    self._render_snapshot_draw(top_row, block.end_row, left_col, right_col, file_path)
+                    self._render_snapshot_draw_rows(selected_rows, left_col, right_col, file_path)
 
                 snapshots.append(
                     {
@@ -453,9 +622,10 @@ class GradeQuoteExtractor:
                         "服务代码原文": block.service_text,
                         "row_range": f"{block.start_row}-{block.end_row}",
                         "range": {
-                            "top_left": f"{get_column_letter(left_col)}{top_row}",
-                            "bottom_right": f"{get_column_letter(right_col)}{block.end_row}",
+                            "top_left": f"{get_column_letter(left_col)}{selected_rows[0]}",
+                            "bottom_right": f"{get_column_letter(right_col)}{selected_rows[-1]}",
                         },
+                        "selected_rows": selected_rows,
                         "snapshot": str(file_path),
                         "engine": used_engine,
                     }

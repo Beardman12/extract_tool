@@ -1066,6 +1066,18 @@ def apply_grade_to_promo(
             merged_lookup_by_sheet[ws.title] = merged_lookup
         autofit_changed_rows += _autofit_table_rows(ws, table_item, merged_lookup)
 
+    # 覆盖输出仅保留本次命中的相关工作表，避免夹带不相干sheet。
+    related_sheet_names = {table_item.sheet_name for table_item in tables}
+    if related_sheet_names:
+        removed_sheet_names: List[str] = []
+        for ws in list(wb.worksheets):
+            if ws.title not in related_sheet_names:
+                wb.remove(ws)
+                removed_sheet_names.append(ws.title)
+        if removed_sheet_names:
+            _log(f"[覆盖] 已移除无关工作表: {len(removed_sheet_names)}")
+        _log(f"[覆盖] 保留工作表: {', '.join(sorted(related_sheet_names))}")
+
     wb.save(modified_excel)
     write_excel_ms = _ms(write_excel_start)
     if autofit_changed_rows > 0:

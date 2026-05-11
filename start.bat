@@ -34,7 +34,7 @@ if not defined BASE_PY_MODE (
   exit /b 1
 )
 
-echo [1/5] 检查 Python 虚拟环境...
+echo [1/6] 检查 Python 虚拟环境...
 if not exist ".venv\Scripts\python.exe" (
   echo 未检测到 .venv，开始创建...
   call :RunBasePython -m venv .venv
@@ -47,10 +47,28 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "PYTHON=%CD%\.venv\Scripts\python.exe"
 
-echo [2/5] 准备 pip...
+echo [2/6] 自动检测 API 端口...
+set "API_PORT="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ports=8003,8004,8005,8010,8080,9000; $chosen=0; foreach($p in $ports){ try{ $l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,$p); $l.Start(); $l.Stop(); $chosen=$p; break } catch {} }; Write-Output $chosen"`) do set "API_PORT=%%P"
+
+if "%API_PORT%"=="0" (
+  echo 未找到可用 API 端口，请关闭占用端口的进程后重试。
+  pause
+  exit /b 1
+)
+
+if not defined API_PORT (
+  echo 端口探测失败，请检查 Python 执行环境。
+  pause
+  exit /b 1
+)
+
+echo 检测到可用 API 端口: %API_PORT%
+
+echo [3/6] 准备 pip...
 "%PYTHON%" -m ensurepip --upgrade >nul 2>&1
 
-echo [3/5] 安装/更新依赖...
+echo [4/6] 安装/更新依赖...
 "%PYTHON%" -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 (
   echo pip 基础工具安装失败。
@@ -65,7 +83,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [4/5] 检查 .env 邮箱配置...
+echo [5/6] 检查 .env 邮箱配置...
 if not exist ".env" (
   echo 未找到 .env，开始引导创建。
   set /p IMAP_USERNAME=请输入 IMAP_USERNAME:
@@ -79,12 +97,12 @@ if not exist ".env" (
   echo 已存在 .env，跳过创建。
 )
 
-echo [5/5] 启动 API 和定时服务...
-start "AI Price API" cmd /k ""%PYTHON%" api_server.py"
-start "AI Price Scheduler" cmd /k ""%PYTHON%" [run_scheduler.py](http://_vscodecontentref_/0) --interval 300"
+echo [6/6] 启动 API 和定时服务...
+start "AI Price API" cmd /k "set API_PORT=%API_PORT% && \"%PYTHON%\" api_server.py"
+start "AI Price Scheduler" cmd /k ""%PYTHON%" scripts\run_scheduler.py --interval 300"
 
 echo 启动完成。
-echo API: http://127.0.0.1:8003/docs
+echo API: http://127.0.0.1:%API_PORT%/docs
 pause
 exit /b 0
 

@@ -1,21 +1,47 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-
-rem 切到脚本所在目录（仓库根目录）
 cd /d "%~dp0"
+
+rem 可选：如果 python 不在 PATH，把路径写在这里
+rem set "PYTHON_EXE=C:\Users\YourName\AppData\Local\Programs\Python\Python314\python.exe"
+
+set "BASE_PY_MODE="
+set "BASE_PY_EXE="
+
+if defined PYTHON_EXE (
+  if exist "%PYTHON_EXE%" (
+    set "BASE_PY_MODE=custom"
+    set "BASE_PY_EXE=%PYTHON_EXE%"
+  )
+)
+
+if not defined BASE_PY_MODE (
+  where python >nul 2>nul
+  if not errorlevel 1 set "BASE_PY_MODE=python"
+)
+
+if not defined BASE_PY_MODE (
+  where py >nul 2>nul
+  if not errorlevel 1 set "BASE_PY_MODE=py"
+)
+
+if not defined BASE_PY_MODE (
+  echo 未找到可用 Python。
+  echo 方案1：安装 Python 3.14+ 并勾选 Add python.exe to PATH
+  echo 方案2：在本脚本顶部配置 PYTHON_EXE 为 python.exe 的绝对路径
+  pause
+  exit /b 1
+)
 
 echo [1/5] 检查 Python 虚拟环境...
 if not exist ".venv\Scripts\python.exe" (
   echo 未检测到 .venv，开始创建...
-  py -3.14 -m venv .venv >nul 2>&1
+  call :RunBasePython -m venv .venv
   if errorlevel 1 (
-    py -3 -m venv .venv
-    if errorlevel 1 (
-      echo 创建虚拟环境失败，请确认已安装 Python 3.14+ 或 py 启动器可用。
-      pause
-      exit /b 1
-    )
+    echo 创建虚拟环境失败。
+    pause
+    exit /b 1
   )
 )
 
@@ -53,18 +79,26 @@ if not exist ".env" (
   echo 已存在 .env，跳过创建。
 )
 
-set "API_PORT=8003"
-set /p API_PORT=请输入 API 端口（默认 8003）:
-if "%API_PORT%"=="" set "API_PORT=8003"
-
 echo [5/5] 启动 API 和定时服务...
-start "AI Price API" cmd /k ""%PYTHON%" scripts\run_api.py --port %API_PORT%"
-start "AI Price Scheduler" cmd /k ""%PYTHON%" scripts\run_scheduler.py --interval 300"
+start "AI Price API" cmd /k ""%PYTHON%" api_server.py"
+start "AI Price Scheduler" cmd /k ""%PYTHON%" [run_scheduler.py](http://_vscodecontentref_/0) --interval 300"
 
-echo.
-echo 启动完成：
-echo API 地址: http://127.0.0.1:%API_PORT%/docs
-echo Scheduler 间隔: 300 秒
-echo.
-echo 关闭服务：直接关闭对应命令行窗口即可。
+echo 启动完成。
+echo API: http://127.0.0.1:8003/docs
 pause
+exit /b 0
+
+:RunBasePython
+if "%BASE_PY_MODE%"=="custom" (
+  "%BASE_PY_EXE%" %*
+  exit /b %errorlevel%
+)
+if "%BASE_PY_MODE%"=="python" (
+  python %*
+  exit /b %errorlevel%
+)
+if "%BASE_PY_MODE%"=="py" (
+  py -3 %*
+  exit /b %errorlevel%
+)
+exit /b 1

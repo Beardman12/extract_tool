@@ -3,44 +3,37 @@ setlocal EnableExtensions
 chcp 65001 >nul
 cd /d "%~dp0"
 
-rem 可选：如果 python 不在 PATH，把路径写在这里
-rem set "PYTHON_EXE=C:\Users\YourName\AppData\Local\Programs\Python\Python314\python.exe"
+rem Optional: set a fixed Python 3.14 path if needed.
+rem set "PYTHON_EXE=E:\setups\vmr_sdks\versions\python_versions\python-3.14.0\python.exe"
 
-set "BASE_PY_MODE="
-set "BASE_PY_EXE="
-
-if defined PYTHON_EXE (
-  if exist "%PYTHON_EXE%" (
-    set "BASE_PY_MODE=custom"
-    set "BASE_PY_EXE=%PYTHON_EXE%"
+set "BASE_PY_EXE=E:\setups\vmr_sdks\versions\python_versions\python-3.14.0\python.exe"
+rem Backward compatible: if user set BASE_PY_EXE manually, treat it as PYTHON_EXE.
+if not defined PYTHON_EXE (
+  if defined BASE_PY_EXE (
+    set "PYTHON_EXE=%BASE_PY_EXE%"
   )
 )
 
-if not defined BASE_PY_MODE (
-  where python >nul 2>nul
-  if not errorlevel 1 set "BASE_PY_MODE=python"
-)
-
-if not defined BASE_PY_MODE (
-  where py >nul 2>nul
-  if not errorlevel 1 set "BASE_PY_MODE=py"
-)
-
-if not defined BASE_PY_MODE (
-  echo 未找到可用 Python。
-  echo 方案1：安装 Python 3.14+ 并勾选 Add python.exe to PATH
-  echo 方案2：在本脚本顶部配置 PYTHON_EXE 为 python.exe 的绝对路径
+set "BASE_PY_EXE="
+call :ResolveBasePython314
+if errorlevel 1 (
+  echo Could not find Python 3.14+ for this script.
+  echo In PowerShell you may see another python than CMD uses.
+  echo Please set PYTHON_EXE at the top of this script to your Python 3.14 path.
   pause
   exit /b 1
 )
 
-echo [1/6] 检查 Python 虚拟环境...
+echo Using base Python: %BASE_PY_EXE%
+"%BASE_PY_EXE%" --version
+
+echo [1/6] Check Python virtual environment...
 if not exist ".venv\Scripts\python.exe" (
-  echo 未检测到 .venv，开始创建...
+  echo .venv not found, creating...
   call :CreateVenv ".venv"
   if errorlevel 1 (
-    echo 创建虚拟环境失败。
-    echo 请在脚本顶部配置 PYTHON_EXE 指向 Python 3.14 的 python.exe。
+    echo Failed to create virtual environment.
+    echo Please set PYTHON_EXE to an absolute Python 3.14 path.
     pause
     exit /b 1
   )
@@ -48,129 +41,149 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "PYTHON=%CD%\.venv\Scripts\python.exe"
 
-echo 校验虚拟环境 Python 版本...
+echo Validate .venv Python version...
 call :CheckPython314 "%PYTHON%"
 if errorlevel 1 (
-  echo 当前 .venv Python 版本不满足要求 ^(>=3.14^)，将重建 .venv。
+  echo .venv Python is not 3.14+, rebuilding...
   call :RebuildVenv ".venv"
   if errorlevel 1 (
-    echo 重建虚拟环境失败。
-    echo 当前基础解释器模式: %BASE_PY_MODE%
-    if defined BASE_PY_EXE echo 当前基础解释器路径: %BASE_PY_EXE%
-    echo 建议在脚本顶部显式设置 PYTHON_EXE 为 Python 3.14 的绝对路径后重试。
+    echo Failed to rebuild virtual environment.
+    echo Base Python path: %BASE_PY_EXE%
+    echo Please set PYTHON_EXE to an absolute Python 3.14 path and retry.
     pause
     exit /b 1
   )
   set "PYTHON=%CD%\.venv\Scripts\python.exe"
   call :CheckPython314 "%PYTHON%"
   if errorlevel 1 (
-    echo 仍未获得 Python 3.14+ 虚拟环境。
-    echo 如果你安装了多个 Python，请在脚本顶部配置 PYTHON_EXE 指向 3.14 的 python.exe。
+    echo Still not getting Python 3.14+ in .venv.
+    echo Please set PYTHON_EXE to an absolute Python 3.14 path.
     pause
     exit /b 1
   )
 )
 
-echo [2/6] 自动检测 API 端口...
+echo [2/6] Auto detect API port...
 set "API_PORT="
 for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ports=8003,8004,8005,8010,8080,9000; $chosen=0; foreach($p in $ports){ try{ $l=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,$p); $l.Start(); $l.Stop(); $chosen=$p; break } catch {} }; Write-Output $chosen"`) do set "API_PORT=%%P"
 
 if "%API_PORT%"=="0" (
-  echo 未找到可用 API 端口，请关闭占用端口的进程后重试。
+  echo No available API port found.
   pause
   exit /b 1
 )
 
 if not defined API_PORT (
-  echo 端口探测失败，请检查 Python 执行环境。
+  echo Failed to detect API port.
   pause
   exit /b 1
 )
 
-echo 检测到可用 API 端口: %API_PORT%
+echo Detected API port: %API_PORT%
 
-echo [3/6] 准备 pip...
+echo [3/6] Prepare pip...
 "%PYTHON%" -m ensurepip --upgrade >nul 2>&1
 
-echo [4/6] 安装/更新依赖...
+echo [4/6] Install/update dependencies...
 "%PYTHON%" -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 (
-  echo pip 基础工具安装失败。
+  echo Failed to install pip/setuptools/wheel.
   pause
   exit /b 1
 )
 
 "%PYTHON%" -m pip install -e .
 if errorlevel 1 (
-  echo 项目依赖安装失败。
+  echo Failed to install project dependencies.
   pause
   exit /b 1
 )
 
-echo [5/6] 检查 .env 邮箱配置...
+echo [5/6] Check .env mail config...
 if not exist ".env" (
-  echo 未找到 .env，开始引导创建。
-  set /p IMAP_USERNAME=请输入 IMAP_USERNAME:
-  set /p IMAP_PASSWORD=请输入 IMAP_PASSWORD:
+  echo .env not found, creating now.
+  set /p IMAP_USERNAME=Please input IMAP_USERNAME: 
+  set /p IMAP_PASSWORD=Please input IMAP_PASSWORD: 
   (
     echo IMAP_USERNAME=%IMAP_USERNAME%
     echo IMAP_PASSWORD=%IMAP_PASSWORD%
   ) > ".env"
-  echo .env 已创建。
+  echo .env created.
 ) else (
-  echo 已存在 .env，跳过创建。
+  echo .env exists, skip create.
 )
 
-echo [6/6] 启动 API 和定时服务...
-start "AI Price API" cmd /k "set API_PORT=%API_PORT% && \"%PYTHON%\" api_server.py"
-start "AI Price Scheduler" cmd /k ""%PYTHON%" scripts\run_scheduler.py --interval 300"
+echo [6/6] Start API and scheduler...
+start "AI Price API" cmd /k ""%PYTHON%" "api_server.py""
+start "AI Price Scheduler" cmd /k ""%PYTHON%" "scripts\run_scheduler.py" --interval 300"
 
-echo 启动完成。
+echo Started successfully.
 echo API: http://127.0.0.1:%API_PORT%/docs
 pause
 exit /b 0
 
 :CreateVenv
-call :RunBasePython -m venv "%~1"
+"%BASE_PY_EXE%" -m venv "%~1"
 if errorlevel 1 exit /b 1
 if not exist "%~1\Scripts\python.exe" exit /b 1
 exit /b 0
 
 :RebuildVenv
-call :RunBasePython -m venv --clear "%~1"
+"%BASE_PY_EXE%" -m venv --clear "%~1"
 if errorlevel 1 (
-  call :RunBasePython -m venv "%~1"
+  "%BASE_PY_EXE%" -m venv "%~1"
   if errorlevel 1 exit /b 1
 )
 if not exist "%~1\Scripts\python.exe" exit /b 1
 exit /b 0
 
-:RunBasePython
-if "%BASE_PY_MODE%"=="custom" (
-  "%BASE_PY_EXE%" %*
-  exit /b %errorlevel%
-)
-if "%BASE_PY_MODE%"=="python" (
-  python %*
-  if not errorlevel 1 exit /b 0
-  where py >nul 2>nul
-  if not errorlevel 1 (
-    py -3.14 %*
-    exit /b %errorlevel%
+:ResolveBasePython314
+if defined PYTHON_EXE (
+  if exist "%PYTHON_EXE%" (
+    call :CheckPython314 "%PYTHON_EXE%"
+    if not errorlevel 1 (
+      set "BASE_PY_EXE=%PYTHON_EXE%"
+      exit /b 0
+    )
   )
-  exit /b 1
 )
-if "%BASE_PY_MODE%"=="py" (
-  py -3.14 %*
-  if not errorlevel 1 exit /b 0
-  where python >nul 2>nul
+
+call :ResolveFromPyLauncher
+if not errorlevel 1 exit /b 0
+
+for /f "delims=" %%P in ('where python 2^>nul') do (
+  call :CheckPython314 "%%P"
   if not errorlevel 1 (
-    python %*
-    exit /b %errorlevel%
+    set "BASE_PY_EXE=%%P"
+    exit /b 0
   )
-  exit /b 1
 )
+
 exit /b 1
+
+:ResolveFromPyLauncher
+where py >nul 2>nul
+if errorlevel 1 exit /b 1
+
+set "_PY_PATH_OUT=%TEMP%\py_path_%RANDOM%_%RANDOM%.txt"
+py -3.14 -c "import sys; print(sys.executable)" > "%_PY_PATH_OUT%" 2>nul
+if errorlevel 1 (
+  del /q "%_PY_PATH_OUT%" >nul 2>nul
+  exit /b 1
+)
+
+set "_PY_CAND="
+set /p _PY_CAND=<"%_PY_PATH_OUT%"
+del /q "%_PY_PATH_OUT%" >nul 2>nul
+
+if not defined _PY_CAND exit /b 1
+if not exist "%_PY_CAND%" exit /b 1
+
+call :CheckPython314 "%_PY_CAND%"
+if errorlevel 1 exit /b 1
+
+set "BASE_PY_EXE=%_PY_CAND%"
+exit /b 0
 
 :CheckPython314
 set "_CHECK_OUT=%TEMP%\pyver_check_%RANDOM%_%RANDOM%.txt"

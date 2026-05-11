@@ -8,17 +8,19 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 POLL_INTERVAL_SECONDS = 300
-TARGET_SUBJECT_KEYWORD = "直发报价调整"
+TARGET_SUBJECT_KEYWORD = "直发报价"
 DEFAULT_IMAP_HOST = "imap.exmail.qq.com"
 DEFAULT_IMAP_PORT = 993
+DEFAULT_LOOKBACK_DAYS = 5
 
 BASE_DIR = Path(__file__).resolve().parents[4]
 ENV_PATH = BASE_DIR / ".env"
@@ -55,6 +57,7 @@ def get_config() -> Dict[str, str]:
         "imap_port": pick("IMAP_PORT", str(DEFAULT_IMAP_PORT)),
         "imap_folder": pick("IMAP_FOLDER", "INBOX"),
         "subject_keyword": pick("TARGET_SUBJECT_KEYWORD", TARGET_SUBJECT_KEYWORD),
+        "lookback_days": pick("MAIL_LOOKBACK_DAYS", str(DEFAULT_LOOKBACK_DAYS)),
     }
 
     if not config["username"] or not config["password"]:
@@ -115,15 +118,24 @@ def decode_filename(part) -> Optional[str]:
         return filename
 
 
-def save_message_attachments(msg, subject_keyword: str) -> Tuple[int, Optional[Path]]:
-    subject = decode_mime_text(str(msg.get("Subject", "")))
-    if subject_keyword not in subject:
-        return 0, None
+def _normalize_subject(subject: str) -> str:
+    normalized = subject.strip()
+    # 去掉常见转发/回复前缀，如 Re: / Fw: / Fwd:
+    while True:
+        updated = re.sub(r"(?i)^\s*(re|fw|fwd)\s*:\s*", "", normalized).strip()
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
 
-    saved_count = 0
-    folder_name = make_timestamp_folder()
-    target_dir = OUTPUT_ROOT / folder_name
-    target_dir.mkdir(parents=True, exist_ok=True)
+
+def _is_target_subject(subject: str, subject_keyword: str) -> bool:
+    return subject_keyword in _normalize_subject(subject)
+
+
+def _collect_required_attachments(msg) -> List[Tuple[str, bytes]]:
+    promo_candidate: Optional[Tuple[str, bytes]] = None
+    vip_candidate: Optional[Tuple[str, bytes]] = None
 
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
@@ -133,15 +145,34 @@ def save_message_attachments(msg, subject_keyword: str) -> Tuple[int, Optional[P
         if "attachment" not in disposition.lower():
             continue
 
-        filename = decode_filename(part)
-        if not filename:
-            filename = f"attachment_{saved_count + 1}.bin"
+        filename = decode_filename(part) or "attachment.bin"
         filename = sanitize_filename(filename)
-
         payload = part.get_payload(decode=True)
         if payload is None:
             continue
 
+        lower_name = filename.lower()
+        if "推广报价" in filename:
+            promo_candidate = (filename, payload)
+        if "vip" in lower_name:
+            vip_candidate = (filename, payload)
+
+    if promo_candidate is None or vip_candidate is None:
+        return []
+    return [promo_candidate, vip_candidate]
+
+
+def save_message_attachments(msg) -> Tuple[int, Optional[Path]]:
+    required_attachments = _collect_required_attachments(msg)
+    if not required_attachments:
+        return 0, None
+
+    saved_count = 0
+    folder_name = make_timestamp_folder()
+    target_dir = OUTPUT_ROOT / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename, payload in required_attachments:
         save_path = target_dir / filename
         # 避免同名覆盖
         if save_path.exists():
@@ -167,8 +198,8 @@ def save_message_attachments(msg, subject_keyword: str) -> Tuple[int, Optional[P
 
 
 def trigger_prebuild_for_batch(batch_dir: Path) -> None:
-    promo_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "推广报价表" in p.name for p in batch_dir.glob("*.xlsx"))
-    vip_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "直发产品定价" in p.name for p in batch_dir.glob("*.xlsx"))
+    promo_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "推广报价" in p.name for p in batch_dir.glob("*.xlsx"))
+    vip_found = any(p.is_file() and p.suffix.lower() == ".xlsx" and "vip" in p.name.lower() for p in batch_dir.glob("*.xlsx"))
     if not (promo_found and vip_found):
         print(f"[预生成] 跳过，批次目录内推广/VIP文件不完整: {batch_dir}")
         return
@@ -191,6 +222,27 @@ def trigger_prebuild_for_batch(batch_dir: Path) -> None:
         print("[预生成] 执行完成")
 
 
+def _parse_mail_datetime(msg) -> datetime:
+    raw_date = str(msg.get("Date", "")).strip()
+    if not raw_date:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    try:
+        parsed = parsedate_to_datetime(raw_date)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _imap_since_date(days: int) -> str:
+    # IMAP SINCE 使用格式: 11-May-2026
+    target = datetime.now() - timedelta(days=max(0, days))
+    return target.strftime("%d-%b-%Y")
+
+
 def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
     host = config["imap_host"]
     port = int(config["imap_port"])
@@ -198,6 +250,8 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
     password = config["password"]
     folder = config["imap_folder"]
     subject_keyword = config["subject_keyword"]
+    lookback_days = max(1, int(config.get("lookback_days", DEFAULT_LOOKBACK_DAYS)))
+    since_date = _imap_since_date(lookback_days)
 
     print(f"连接 IMAP: {host}:{port}, 文件夹: {folder}")
     with imaplib.IMAP4_SSL(host, port) as client:
@@ -206,16 +260,44 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
         if status != "OK":
             raise RuntimeError(f"无法选择邮箱文件夹: {folder}")
 
-        status, msg_data = client.uid("SEARCH", None, "ALL")
+        status, msg_data = client.uid("SEARCH", None, "SINCE", since_date)
         if status != "OK":
             raise RuntimeError("搜索邮件失败")
 
-        all_uids = msg_data[0].decode("utf-8").split()
+        all_uids = msg_data[0].decode("utf-8").split() if msg_data and msg_data[0] else []
         new_uids = [uid for uid in all_uids if uid not in seen_uids]
-        print(f"本次扫描 UID 总数: {len(all_uids)}, 未处理: {len(new_uids)}")
+        print(f"本次扫描 UID 总数(最近{lookback_days}天): {len(all_uids)}, 未处理: {len(new_uids)}")
 
-        saved_total = 0
+        if not new_uids:
+            return 0
+
+        matching_messages: List[Tuple[datetime, int, str]] = []
+
         for uid in new_uids:
+            status, fetched = client.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])")
+            if status != "OK" or not fetched or fetched[0] is None:
+                continue
+
+            raw_header = fetched[0][1]
+            if not raw_header:
+                continue
+
+            header_msg = message_from_bytes(raw_header)
+            subject = decode_mime_text(str(header_msg.get("Subject", "")))
+            if not _is_target_subject(subject, subject_keyword):
+                continue
+
+            msg_time = _parse_mail_datetime(header_msg)
+            uid_num = int(uid) if uid.isdigit() else 0
+            matching_messages.append((msg_time, uid_num, uid))
+
+        if not matching_messages:
+            return 0
+
+        matching_messages.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        print(f"匹配主题邮件: {len(matching_messages)}，本轮按时间倒序仅处理第一封附件完整邮件")
+
+        for _, _, uid in matching_messages:
             status, fetched = client.uid("FETCH", uid, "(RFC822)")
             if status != "OK" or not fetched or fetched[0] is None:
                 continue
@@ -225,14 +307,19 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str]) -> int:
                 continue
 
             msg = message_from_bytes(raw_email)
-            saved, batch_dir = save_message_attachments(msg, subject_keyword)
-            saved_total += saved
+            saved, batch_dir = save_message_attachments(msg)
+
+            # 同一轮只处理一封，且该封必须同时含推广报价与VIP两个附件。
+            if saved > 0 and batch_dir is not None:
+                seen_uids.add(uid)
+                trigger_prebuild_for_batch(batch_dir)
+                return saved
+
+            # 避免同一封不完整邮件在后续轮次反复命中。
             seen_uids.add(uid)
 
-            if saved > 0 and batch_dir is not None:
-                trigger_prebuild_for_batch(batch_dir)
-
-        return saved_total
+        print("命中主题邮件存在，但未找到同时包含推广报价与VIP附件的邮件")
+        return 0
 
 
 def run_single_cycle() -> int:

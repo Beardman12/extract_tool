@@ -50,6 +50,11 @@ BASE_DIR = _resolve_base_dir()
 ENV_PATH = BASE_DIR / ".env"
 OUTPUT_ROOT = BASE_DIR / "output" / "mail_attachments" / "direct_price_adjustment"
 STATE_PATH = BASE_DIR / "output" / "mail_fetch_state.json"
+DEFAULT_STATE_PAYLOAD = {
+    "seen_uids": [],
+    "seen_message_ids": [],
+    "seen_subjects": {},
+}
 
 
 def load_env_file(env_path: Path) -> Dict[str, str]:
@@ -93,33 +98,73 @@ def get_config() -> Dict[str, str]:
     return config
 
 
-def load_seen_state() -> Tuple[Set[str], Set[str]]:
+def ensure_state_file() -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not STATE_PATH.exists():
-        return set(), set()
+        STATE_PATH.write_text(json.dumps(DEFAULT_STATE_PAYLOAD, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_seen_state() -> Tuple[Set[str], Set[str], Dict[str, str]]:
+    ensure_state_file()
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        seen_uids = set(data.get("seen_uids", []))
-        seen_message_ids = set(data.get("seen_message_ids", []))
-        return seen_uids, seen_message_ids
+        if not isinstance(data, dict):
+            raise ValueError("state payload is not an object")
+        seen_uids_raw = data.get("seen_uids", [])
+        seen_message_ids_raw = data.get("seen_message_ids", [])
+        seen_subjects_raw = data.get("seen_subjects", {})
+        if not isinstance(seen_uids_raw, list) or not isinstance(seen_message_ids_raw, list):
+            raise ValueError("state payload fields are invalid")
+        if not isinstance(seen_subjects_raw, dict):
+            seen_subjects_raw = {}
+        seen_uids = {str(item) for item in seen_uids_raw if str(item).strip()}
+        seen_message_ids = {str(item) for item in seen_message_ids_raw if str(item).strip()}
+        seen_subjects: Dict[str, str] = {
+            str(uid): str(subject)
+            for uid, subject in seen_subjects_raw.items()
+            if str(uid).strip()
+        }
+        return seen_uids, seen_message_ids, seen_subjects
     except Exception:
-        return set(), set()
+        # 状态文件损坏时自动重建，避免任务中断。
+        STATE_PATH.write_text(json.dumps(DEFAULT_STATE_PAYLOAD, ensure_ascii=False, indent=2), encoding="utf-8")
+        return set(), set(), {}
 
 
-def save_seen_state(seen_uids: Set[str], seen_message_ids: Set[str]) -> None:
+def save_seen_state(seen_uids: Set[str], seen_message_ids: Set[str], seen_subjects: Dict[str, str]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # 与磁盘现有状态做并集，降低并发运行时的覆盖风险。
-    disk_uids, disk_message_ids = load_seen_state()
+    disk_uids, disk_message_ids, disk_subjects = load_seen_state()
     merged_uids = set(seen_uids) | disk_uids
     merged_message_ids = set(seen_message_ids) | disk_message_ids
+    merged_subjects = dict(disk_subjects)
+    merged_subjects.update({k: v for k, v in seen_subjects.items() if k})
 
     payload = {
         "seen_uids": sorted(merged_uids),
         "seen_message_ids": sorted(merged_message_ids),
+        "seen_subjects": {uid: merged_subjects.get(uid, "") for uid in sorted(merged_uids)},
     }
     temp_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(STATE_PATH)
+
+
+def _remember_seen(
+    uid: str,
+    message_id: str,
+    subject: str,
+    seen_uids: Set[str],
+    seen_message_ids: Set[str],
+    seen_subjects: Dict[str, str],
+) -> None:
+    if uid:
+        seen_uids.add(uid)
+        if subject and uid not in seen_subjects:
+            seen_subjects[uid] = subject
+    if message_id:
+        seen_message_ids.add(message_id)
 
 
 def _extract_message_id(msg) -> str:
@@ -284,7 +329,7 @@ def _imap_since_date(days: int) -> str:
     return target.strftime("%d-%b-%Y")
 
 
-def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Set[str]) -> int:
+def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Set[str], seen_subjects: Dict[str, str]) -> int:
     host = config["imap_host"]
     port = int(config["imap_port"])
     username = config["username"]
@@ -312,7 +357,7 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Se
         if not new_uids:
             return 0
 
-        matching_messages: List[Tuple[datetime, int, str, str]] = []
+        matching_messages: List[Tuple[datetime, int, str, str, str]] = []
 
         for uid in new_uids:
             status, fetched = client.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE MESSAGE-ID)])")
@@ -325,18 +370,19 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Se
 
             header_msg = message_from_bytes(raw_header)
             message_id = _extract_message_id(header_msg)
+            subject = decode_mime_text(str(header_msg.get("Subject", "")))
+
             if message_id and message_id in seen_message_ids:
                 # Message-ID 已处理过时，回填 UID，防止后续轮次重复比较。
-                seen_uids.add(uid)
+                _remember_seen(uid, message_id, subject, seen_uids, seen_message_ids, seen_subjects)
                 continue
 
-            subject = decode_mime_text(str(header_msg.get("Subject", "")))
             if not _is_target_subject(subject, subject_keyword):
                 continue
 
             msg_time = _parse_mail_datetime(header_msg)
             uid_num = int(uid) if uid.isdigit() else 0
-            matching_messages.append((msg_time, uid_num, uid, message_id))
+            matching_messages.append((msg_time, uid_num, uid, message_id, subject))
 
         if not matching_messages:
             return 0
@@ -344,7 +390,7 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Se
         matching_messages.sort(key=lambda x: (x[0], x[1]), reverse=True)
         print(f"匹配主题邮件: {len(matching_messages)}，本轮按时间倒序仅处理第一封附件完整邮件")
 
-        for _, _, uid, header_message_id in matching_messages:
+        for _, _, uid, header_message_id, subject in matching_messages:
             status, fetched = client.uid("FETCH", uid, "(RFC822)")
             if status != "OK" or not fetched or fetched[0] is None:
                 continue
@@ -359,32 +405,37 @@ def fetch_once(config: Dict[str, str], seen_uids: Set[str], seen_message_ids: Se
 
             # 同一轮只处理一封，且该封必须同时含推广报价与VIP两个附件。
             if saved > 0 and batch_dir is not None:
-                seen_uids.add(uid)
-                if message_id:
-                    seen_message_ids.add(message_id)
+                # 标记本轮所有命中主题的邮件为已处理，避免后续轮次再回头处理旧邮件。
+                for _, _, mark_uid, mark_message_id, mark_subject in matching_messages:
+                    _remember_seen(mark_uid, mark_message_id, mark_subject, seen_uids, seen_message_ids, seen_subjects)
+
+                _remember_seen(uid, message_id, subject, seen_uids, seen_message_ids, seen_subjects)
                 trigger_prebuild_for_batch(batch_dir)
                 return saved
 
             # 避免同一封不完整邮件在后续轮次反复命中。
-            seen_uids.add(uid)
-            if message_id:
-                seen_message_ids.add(message_id)
+            _remember_seen(uid, message_id, subject, seen_uids, seen_message_ids, seen_subjects)
 
         print("命中主题邮件存在，但未找到同时包含推广报价与VIP附件的邮件")
         return 0
 
 
 def run_single_cycle() -> int:
-    config = get_config()
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    print(f"状态文件路径: {STATE_PATH}")
-    seen_uids, seen_message_ids = load_seen_state()
+    ensure_state_file()
+    seen_uids, seen_message_ids, seen_subjects = load_seen_state()
     saved_count = 0
+    print(f"状态文件路径: {STATE_PATH}")
     try:
-        saved_count = fetch_once(config, seen_uids, seen_message_ids)
+        config = get_config()
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        saved_count = fetch_once(config, seen_uids, seen_message_ids, seen_subjects)
     finally:
         # 即使抓取流程中途异常，也要落盘已标记状态，避免下轮重复处理。
-        save_seen_state(seen_uids, seen_message_ids)
+        try:
+            save_seen_state(seen_uids, seen_message_ids, seen_subjects)
+        except Exception as exc:
+            print(f"状态文件写入失败: {STATE_PATH}, error={type(exc).__name__}: {exc}")
+            raise
     print(f"本轮完成，保存附件数量: {saved_count}")
     return saved_count
 

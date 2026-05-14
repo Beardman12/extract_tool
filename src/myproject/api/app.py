@@ -298,9 +298,19 @@ app = FastAPI(title="AI Price API", version="1.0.0")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 
+
+# 从 .env 或环境变量读取允许的跨域域名
+def get_allowed_origins():
+    origins = os.getenv("ALLOWED_ORIGINS")
+    if not origins:
+        # 未配置时仅允许本地开发常用域名
+        return ["http://localhost:8000", "http://127.0.0.1:8000"]
+    # 支持逗号分隔多个域名
+    return [o.strip() for o in origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

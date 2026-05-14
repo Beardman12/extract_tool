@@ -23,11 +23,28 @@ from myproject.services.extract_pricing_details import PricingExtractor
 from myproject.services.grade_quote_extractor import GradeQuoteExtractor
 
 
+
+def _load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
 WORKSPACE = Path(__file__).resolve().parents[3]
 OUTPUT_DIR = WORKSPACE / "output"
 CACHE_DIR = OUTPUT_DIR / "cache"
 LOG_DIR = WORKSPACE / "logs"
 ATTACHMENT_ROOT = OUTPUT_DIR / "mail_attachments" / "direct_price_adjustment"
+
+# 启动时加载工作区根目录 .env
+_load_env_file(WORKSPACE / ".env")
 
 
 _logger: Optional[logging.Logger] = None

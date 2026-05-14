@@ -183,7 +183,20 @@ def _path_to_public_url(path_str: str, request: Request) -> Optional[str]:
                 return None
 
     encoded = "/".join(quote(seg) for seg in rel.split("/"))
-    return f"{request.base_url}{encoded}".rstrip("/")
+
+    # 可通过 .env 配置对外访问前缀，例如 PUBLIC_URL_PREFIX=price
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    public_url_prefix = os.getenv("PUBLIC_URL_PREFIX", "").strip().strip("/")
+
+    if public_base_url:
+        if public_url_prefix:
+            return f"{public_base_url}/{public_url_prefix}/{encoded}"
+        return f"{public_base_url}/{encoded}"
+
+    base_url = str(request.base_url).rstrip("/")
+    if public_url_prefix:
+        return f"{base_url}/{public_url_prefix}/{encoded}"
+    return f"{base_url}/{encoded}"
 
 
 def _collect_image_urls(node: Any, request: Request) -> List[str]:

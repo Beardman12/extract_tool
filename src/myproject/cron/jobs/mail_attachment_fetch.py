@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 POLL_INTERVAL_SECONDS = 300
-TARGET_SUBJECT_KEYWORD = "直发报价"
+TARGET_SUBJECT_KEYWORD = "直发"
 DEFAULT_IMAP_HOST = "imap.exmail.qq.com"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_LOOKBACK_DAYS = 5
